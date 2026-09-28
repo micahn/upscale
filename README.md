@@ -49,6 +49,18 @@ uninstall remove the sandbox and this launcher
 
 Default output is `<name>-<size>.png` next to the input.
 
+With `-o` and several inputs, outputs are written flat into that directory, named
+after each input's basename. Since that makes a clash possible, `upscale` checks
+the whole batch first and refuses to run if two inputs would land on the same
+file — before spending any GPU time on a result that would be overwritten:
+
+```sh
+upscale 4K a/photo.png b/photo.png -o out/
+# upscale: two or more inputs resolve to the same output:
+#   out/photo-4k.png  <-  a/photo.png and b/photo.png
+#   Nothing was written. Rename them, or run them as separate batches.
+```
+
 Every input in a batch is attempted even if an earlier one fails, so an
 unmatched glob partway through a list doesn't cost you the whole run. Failures
 are reported per file, and `upscale` still exits non-zero if anything failed,
