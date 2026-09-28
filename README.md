@@ -49,6 +49,19 @@ uninstall remove the sandbox and this launcher
 
 Default output is `<name>-<size>.png` next to the input.
 
+Every input in a batch is attempted even if an earlier one fails, so an
+unmatched glob partway through a list doesn't cost you the whole run. Failures
+are reported per file, and `upscale` still exits non-zero if anything failed,
+so scripts notice:
+
+```sh
+upscale 1080 ~/pics/*.jpg -o out/
+# wrote out/a-1080.png
+# no such file: /home/you/pics/dSC0001.JPG  (did your glob match anything?)
+# wrote out/b-1080.png
+# finished with errors; some files were skipped (see above)
+```
+
 ### Models
 
 `realesr-animevideov3` is the default. It handles x2, x3 and x4, so it's the only
