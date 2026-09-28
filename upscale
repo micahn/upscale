@@ -73,6 +73,74 @@ ensure_tool() {
   printf '%s' "$d/realesrgan-ncnn-vulkan"
 }
 
+# String-only checks on a candidate sandbox root: non-empty, not /, not $HOME,
+# and deep enough that we are not looking at a stray top-level directory.
+root_path_ok() {
+  local r=$1 slashes
+  [[ -n $r ]] || return 1
+  r=${r%/}
+  case "$r" in
+    /|"$HOME") return 1 ;;
+  esac
+  slashes=$(printf %s "$r" | tr -cd '/' | wc -c)
+  (( slashes >= 2 ))
+}
+
+# root_is_safe additionally requires the sandbox marker, so we only ever remove
+# a directory this tool actually built. $ROOT comes straight from UPSCALE_HOME,
+# so an inherited or mistyped value must not become an arbitrary `rm -rf`.
+root_is_safe() {
+  root_path_ok "$1" && [[ -d "$1/mise" ]]
+}
+
+# Remove the launcher we were invoked as, but only when that is safe: a file
+# named "upscale" in a bin directory, matching the one on PATH. A git checkout
+# or a dotfiles repo is left alone.
+remove_launcher() {
+  local force=$1 me=${0:-} onpath
+  if [[ ! -f $me ]]; then
+    printf 'upscale: no launcher at %s, nothing to remove there.\n' "${me:-<unknown>}" >&2
+  elif [[ ${me##*/} != upscale ]]; then
+    printf 'upscale: leaving %s alone (not named "upscale").\n' "$me" >&2
+  else
+    onpath=$(command -v upscale 2>/dev/null || :)
+    if [[ -n $onpath && $onpath != "$me" ]]; then
+      printf 'upscale: leaving %s alone; the launcher on PATH is %s.\n' "$me" "$onpath" >&2
+    elif [[ $force -ne 1 && $me != */bin/upscale ]]; then
+      printf 'upscale: leaving %s alone (not in a bin directory). Pass --all to remove it anyway.\n' "$me" >&2
+    else
+      rm -f "$me"
+      printf 'upscale: removed launcher %s\n' "$me" >&2
+    fi
+  fi
+}
+
+do_uninstall() {
+  local assume_yes=$1 force=$2 reply
+  if [[ -e $ROOT || -L $ROOT ]]; then
+    root_is_safe "$ROOT" \
+      || die "refusing to remove '$ROOT': it does not look like the upscale sandbox.
+  Only a directory with a mise/ inside it, at least two levels deep, and
+  neither / nor \$HOME, is removed. If UPSCALE_HOME is set, unset it and retry."
+    if (( assume_yes )); then
+      printf 'upscale: removing %s\n' "$ROOT" >&2
+    else
+      printf 'about to remove %s\n' "$ROOT" >&2
+      # /dev/tty exists but fails to open when there is no controlling terminal,
+      # so the shell's own redirection error is suppressed and we report our own.
+      read -r -p 'proceed? [y/N] ' reply 2>/dev/null < /dev/tty \
+        || die "could not confirm (no tty); re-run with -y to skip the prompt"
+      case "${reply,,}" in y|yes) ;; *) die "aborted" ;; esac
+    fi
+    rm -rf "$ROOT"
+    printf 'upscale: removed sandbox %s\n' "$ROOT" >&2
+  else
+    printf 'upscale: no sandbox at %s\n' "$ROOT" >&2
+  fi
+  remove_launcher "$force"
+  printf 'upscale: uninstall complete.\n' >&2
+}
+
 usage() {
   cat <<EOF
 upscale - local AI image upscaler
@@ -87,7 +155,9 @@ options
   -o PATH   output file, or directory when several inputs
   -m NAME   realesr model (default: $MODEL)
   selftest  check the size/scale logic, no GPU needed
-  uninstall remove everything this installed
+  uninstall remove the sandbox, and the launcher if it looks installed
+          -y, --yes  skip the confirmation prompt
+          --all      remove the launcher even outside a bin directory
 EOF
 }
 
@@ -109,6 +179,23 @@ selftest() {
   check s-4       "$(pick_scale 200 120 800 480)"     "4"
   check s-4-max   "$(pick_scale 100 100 8000 8000)"   "4"
   check s-3       "$(pick_scale 400 300 1200 900)"    "3"
+  # uninstall safety: the guard must only accept a real, deep sandbox
+  local sandbox
+  sandbox=$(mktemp -d) || die "selftest: mktemp failed"
+  mkdir -p "$sandbox/a/b/mise"
+  check r-marker  "$(root_is_safe "$sandbox/a/b"; echo $?)"  "0"
+  check r-nomise  "$(root_is_safe "$sandbox/a"; echo $?)"    "1"
+  check r-empty   "$(root_is_safe ""; echo $?)"              "1"
+  # string checks, testable without touching the filesystem
+  check p-deep    "$(root_path_ok /tmp/upscale; echo $?)"     "0"
+  check p-abs     "$(root_path_ok "$sandbox/a/b"; echo $?)"   "0"
+  check p-top     "$(root_path_ok /upscale; echo $?)"         "1"
+  check p-rel     "$(root_path_ok upscale; echo $?)"          "1"
+  check p-slash   "$(root_path_ok /; echo $?)"                "1"
+  check p-home    "$(root_path_ok "$HOME"; echo $?)"          "1"
+  check p-empty   "$(root_path_ok ""; echo $?)"               "1"
+  check p-trailing "$(root_path_ok "$sandbox/a/b/"; echo $?)" "0"
+  rm -rf "$sandbox"
   # scratch dir lifecycle: created, private, removable, and never beside the input
   new_workdir
   check w-set     "$([[ -n $WORK && -d $WORK ]] && echo yes)" "yes"
@@ -125,9 +212,17 @@ main() {
   case "${1:-}" in
     ""|-h|--help) usage; exit 0 ;;
     uninstall)
-      rm -rf "$ROOT"
-      [[ -f "$0" ]] && rm -f "$0"
-      echo "upscale: removed sandbox and launcher."
+      shift
+      local assume_yes=0 force=0
+      while (( $# )); do
+        case "$1" in
+          -y|--yes)  assume_yes=1; shift ;;
+          --all)     force=1; shift ;;
+          -h|--help) usage; exit 0 ;;
+          *) die "unknown option for uninstall: $1" ;;
+        esac
+      done
+      do_uninstall "$assume_yes" "$force"
       exit 0 ;;
     selftest) selftest; exit $? ;;
   esac

@@ -93,8 +93,19 @@ failed run leaves nothing behind, and `upscale` can never overwrite a file that
 happens to be named like an intermediate.
 
 ```sh
-upscale uninstall   # deletes the sandbox and the script itself
+upscale uninstall             # asks before deleting; -y to skip the prompt
 ```
+
+`uninstall` is deliberately hard to trigger by accident, because the sandbox
+root comes from `UPSCALE_HOME` and a wrong value there would otherwise mean
+`rm -rf` on an arbitrary directory. It refuses to delete anything that is not
+recognisably the sandbox — the directory must contain a `mise/` folder, be at
+least two levels deep, and be neither `/` nor your home directory.
+
+It also only deletes the launcher when that is unambiguous: a file named
+`upscale` inside a `bin/` directory, matching the one on `PATH`. Run from a git
+checkout or a dotfiles repo, it leaves the file alone and tells you where it
+looked. Pass `--all` to remove the launcher regardless.
 
 Override the location with `UPSCALE_HOME`. Override the model with `UPSCALE_MODEL`.
 
