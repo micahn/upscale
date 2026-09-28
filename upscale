@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# upscale - local AI image upscaler (Real-ESRGAN + Vulkan).
+# Sandbox: everything lives under $UPSCALE_HOME (default ~/.local/share/upscale).
+set -euo pipefail
+
+TOOL="github:xinntao/Real-ESRGAN@0.2.5.0"
+ROOT="${UPSCALE_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/upscale}"
+MODEL="${UPSCALE_MODEL:-realesr-animevideov3}"
+
+export MISE_DATA_DIR="$ROOT/mise/data"
+export MISE_CONFIG_DIR="$ROOT/mise/config"
+export MISE_STATE_DIR="$ROOT/mise/state"
+export MISE_CACHE_DIR="$ROOT/mise/cache"
+
+die() { printf 'upscale: %s\n' "$*" >&2; exit 1; }
+
+# "4K", "2k_uw", "4K-UW", "800x600" -> "W H"
+target_size() {
+  local k="${1,,}"; k="${k//[-_]/}"
+  case "$k" in
+    720)        echo "1280 720"   ;; 720uw)   echo "1680 720"    ;;
+    1080)       echo "1920 1080"  ;; 1080uw)  echo "2560 1080"   ;;
+    1440|2k)    echo "2560 1440"  ;; 1440uw|2kuw) echo "3440 1440" ;;
+    4k)         echo "3840 2160"  ;; 4kuw)    echo "5120 2160"   ;;
+    8k)         echo "7680 4320"  ;; 8kuw)    echo "7680 3240"   ;;
+    *x*)
+      [[ $k =~ ^([1-9][0-9]*)x([1-9][0-9]*)$ ]] && echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}" || return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Real-ESRGAN only does whole 2x/3x/4x. Pick the smallest that covers the target
+# (overshoot + lanczos beats stretching), or 1 if the source is already big enough.
+pick_scale() {
+  local sw=$1 sh=$2 tw=$3 th=$4 c
+  if (( sw >= tw && sh >= th )); then echo 1; return; fi
+  for c in 2 3 4; do
+    if (( sw * c >= tw && sh * c >= th )); then echo "$c"; return; fi
+  done
+  echo 4
+}
+
+ensure_tool() {
+  command -v mise >/dev/null || die "mise not found (https://mise.jdx.dev)"
+  command -v magick >/dev/null || die "ImageMagick 7 not found (pacman -S imagemagick)"
+  local d
+  d=$(mise where "$TOOL" 2>/dev/null) \
+    || { echo "upscale: installing Real-ESRGAN (one time, ~47MB)..." >&2
+         mise use -g "$TOOL" >&2 || die "install failed"
+         d=$(mise where "$TOOL" 2>/dev/null) || die "install failed"; }
+  # mise extracts the zip without the exec bit
+  [[ -x "$d/realesrgan-ncnn-vulkan" ]] || chmod +x "$d/realesrgan-ncnn-vulkan" 2>/dev/null
+  [[ -x "$d/realesrgan-ncnn-vulkan" ]] || die "realesrgan-ncnn-vulkan not runnable at $d"
+  printf '%s' "$d/realesrgan-ncnn-vulkan"
+}
+
+usage() {
+  cat <<EOF
+upscale - local AI image upscaler
+
+  upscale <size> <file...> [options]
+
+size    720 1080 1440 2K 4K 8K   (16:9)
+        720UW 1080UW 1440UW 2KUW 4KUW 8KUW   (ultrawide)
+        WxH   exact, e.g. 800x600   (case-insensitive, - and _ ok)
+
+options
+  -o PATH   output file, or directory when several inputs
+  -m NAME   realesr model (default: $MODEL)
+  selftest  check the size/scale logic, no GPU needed
+  uninstall remove everything this installed
+EOF
+}
+
+selftest() {
+  local f=0
+  check() { if [[ "$2" != "$3" ]]; then printf 'FAIL %s: got "%s" want "%s"\n' "$1" "$2" "$3"; f=1; fi; }
+  check 4k        "$(target_size 4K)"        "3840 2160"
+  check 4k-low    "$(target_size 4k)"        "3840 2160"
+  check 4kuw      "$(target_size 4kUW)"      "5120 2160"
+  check 4k-dash   "$(target_size 4K-UW)"     "5120 2160"
+  check 2k        "$(target_size 2K)"        "2560 1440"
+  check 1080uw    "$(target_size 1080uw)"    "2560 1080"
+  check exact     "$(target_size 800x600)"   "800 600"
+  check exact-bad "$(target_size 800)"       ""
+  check bogus     "$(target_size 4kQ)"       ""
+  check s-1       "$(pick_scale 4000 3000 1920 1080)" "1"
+  check s-2       "$(pick_scale 960 540 1920 1080)"   "2"
+  check s-3-exact "$(pick_scale 640 360 1920 1080)"   "3"
+  check s-4       "$(pick_scale 200 120 800 480)"     "4"
+  check s-4-max   "$(pick_scale 100 100 8000 8000)"   "4"
+  check s-3       "$(pick_scale 400 300 1200 900)"    "3"
+  (( f )) && { echo "selftest: FAILED"; return 1; }
+  echo "selftest: ok"
+}
+
+main() {
+  case "${1:-}" in
+    ""|-h|--help) usage; exit 0 ;;
+    uninstall)
+      rm -rf "$ROOT"
+      [[ -f "$0" ]] && rm -f "$0"
+      echo "upscale: removed sandbox and launcher."
+      exit 0 ;;
+    selftest) selftest; exit $? ;;
+  esac
+
+  local spec="" out="" model="$MODEL"
+  local -a files=()
+  while (( $# )); do
+    case "$1" in
+      -o|--out)   [[ $# -ge 2 ]] || die "$1 needs a value"; out=$2; shift 2 ;;
+      -m|--model) [[ $# -ge 2 ]] || die "$1 needs a value"; model=$2; shift 2 ;;
+      -h|--help)  usage; exit 0 ;;
+      --) shift; files+=("$@"); break ;;
+      -*) die "unknown option $1" ;;
+      *)  if [[ -z $spec ]]; then spec=$1; else files+=("$1"); fi; shift ;;
+    esac
+  done
+
+  [[ -n $spec ]] || die "no target size given (try: upscale 4K photo.png)"
+  (( ${#files[@]} )) || die "no input files given"
+
+  local dims
+  dims=$(target_size "$spec") || die "unknown size '$spec' (try 1080, 4K, 4KUW, 800x600)"
+  local tw th; read -r tw th <<<"$dims"
+
+  local bin; bin=$(ensure_tool)
+
+  local f o sw sh s tmp
+  for f in "${files[@]}"; do
+    [[ -f $f ]] || die "no such file: $f  (did your glob match anything?)"
+    # note: trailing \n is stripped by the command substitution, so this yields "W H"
+    local dims_in
+    dims_in=$(magick identify -format "%w %h" "$f[0]") || die "cannot read image: $f"
+    read -r sw sh <<<"$dims_in"
+
+    s=$(pick_scale "$sw" "$sh" "$tw" "$th")
+    if [[ -n $out ]]; then
+      if (( ${#files[@]} > 1 )) || [[ -d $out ]]; then o="$out/${f%.*}-${spec,,}.png"
+      else o="$out"; fi
+    else o="${f%.*}-${spec,,}.png"; fi
+    mkdir -p "$(dirname "$o")"
+
+    if (( s == 1 )); then
+      tmp="$f"
+    else
+      tmp="${f%.*}.x${s}.png"
+      echo "upscale: $f  ${sw}x${sh} -> x${s} model -> ${tw}x${th}" >&2
+      "$bin" -i "$f" -o "$tmp" -s "$s" -n "$model" >&2
+    fi
+    magick "$tmp" -resize "${tw}x${th}^" -gravity center -extent "${tw}x${th}" "$o"
+    [[ $tmp == "$f" ]] || rm -f "$tmp"
+    echo "upscale: wrote $o" >&2
+  done
+}
+
+main "$@"
