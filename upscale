@@ -211,9 +211,49 @@ selftest() {
   check po-nodir   "$(process_one "$sandbox/a/b/mise" "$sandbox/o.png" 100 100 /bin/false m 1 >/dev/null 2>&1; echo $?)" "1"
   check po-noinput "$(process_one "" "$sandbox/o.png" 100 100 /bin/false m 1 >/dev/null 2>&1; echo $?)" "1"
   cleanup
+  # out_path: the stem is a basename, and -o is a directory for batches
+  check op-one-file  "$(out_path a/photo.png out.png 4K 1)"        "out.png"
+  check op-one-dir   "$(out_path a/photo.png outdir 4K 1)"         "outdir"
+  check op-many      "$(out_path a/photo.png outdir 4K 2)"         "outdir/photo-4k.png"
+  check op-slash     "$(out_path a/photo.png outdir/ 4K 2)"        "outdir/photo-4k.png"
+  check op-nested    "$(out_path x/y/z/p.png outdir 4K 2)"         "outdir/p-4k.png"
+  check op-case      "$(out_path a/P.png outdir 4KUW 2)"           "outdir/P-4kuw.png"
+  check op-dotfile   "$(out_path a/.prof outdir 4K 2)"             "outdir/.prof-4k.png"
+  check op-noext     "$(out_path a/photo outdir 4K 2)"             "outdir/photo-4k.png"
+  check op-multidot  "$(out_path a/b.c.png outdir 4K 2)"           "outdir/b.c-4k.png"
+  check op-beside    "$(out_path a/photo.png "" 4K 1)"             "a/photo-4k.png"
+  check op-beside-dot "$(out_path a/.prof "" 4K 1)"               "a/.prof-4k.png"
+  # the bug: two dirs, same stem, one -o must collide rather than overwrite
+  check op-clash1    "$(out_path a/photo.png o 4K 2)"              "o/photo-4k.png"
+  check op-clash2    "$(out_path b/photo.png o 4K 2)"              "o/photo-4k.png"
   rm -rf "$sandbox"
   (( f )) && { echo "selftest: FAILED"; return 1; }
   echo "selftest: ok"
+}
+
+# Where does this input's output go? With -o and a single input, or when -o names
+# an existing directory, -o is the destination; otherwise the output sits beside
+# the input. The stem is the basename only -- using the whole path would mirror
+# the input's directory tree inside -o, which is not what anyone expects.
+out_path() {
+  local f=$1 out=$2 spec=$3 nfiles=$4 stem
+  if [[ -n $out ]] && (( nfiles == 1 )) && [[ ! -d $out ]]; then
+    printf %s "$out"
+    return
+  fi
+  local base; base=$(basename -- "$f")
+  # Strip a trailing ".ext" from the basename, but not from a leading dot:
+  # .profile is a whole name, not an extension on an empty stem.
+  case "$base" in
+    ?*.*) stem=${base%.*} ;;
+    *)   stem=$base ;;
+  esac
+  if [[ -n $out ]]; then
+    printf '%s/%s-%s.png' "${out%/}" "$stem" "${spec,,}"
+  else
+    # beside the input: keep the directory, but the same stem rules apply
+    printf '%s/%s-%s.png' "$(dirname -- "$f")" "$stem" "${spec,,}"
+  fi
 }
 
 # Process one input file. Returns non-zero on failure so that a batch can carry
@@ -298,17 +338,35 @@ main() {
 
   new_workdir
 
+  # Resolve every output path first. Two inputs mapping to one output would
+  # silently overwrite each other, and that must be caught before any GPU time
+  # is spent, not after the loser's result is already gone.
+  local f o i=0 failed=0
+  local -A seen_out=()
+  local -a clashes=() outs=()
+  for f in "${files[@]}"; do
+    o=$(out_path "$f" "$out" "$spec" "${#files[@]}")
+    if [[ -n ${seen_out[$o]:-} ]]; then
+      clashes+=("$o  <-  ${seen_out[$o]} and $f")
+    else
+      seen_out[$o]=$f
+    fi
+    outs+=("$o")
+  done
+  if (( ${#clashes[@]} )); then
+    printf 'upscale: two or more inputs resolve to the same output:\n' >&2
+    printf '  %s\n' "${clashes[@]}" >&2
+    printf '  Nothing was written. Rename them, or run them as separate batches.\n' >&2
+    return 1
+  fi
+
   # Every input is attempted, even if an earlier one failed: an unmatched glob
   # in the middle of a list should not cost the user the whole batch. The exit
   # status is still non-zero if anything failed, so scripts notice.
-  local f o i=0 failed=0
+  i=0
   for f in "${files[@]}"; do
     i=$((i + 1))
-    if [[ -n $out ]]; then
-      if (( ${#files[@]} > 1 )) || [[ -d $out ]]; then o="$out/${f%.*}-${spec,,}.png"
-      else o="$out"; fi
-    else o="${f%.*}-${spec,,}.png"; fi
-    process_one "$f" "$o" "$tw" "$th" "$bin" "$model" "$i" || failed=1
+    process_one "$f" "${outs[i-1]}" "$tw" "$th" "$bin" "$model" "$i" || failed=1
   done
 
   if (( failed )); then
