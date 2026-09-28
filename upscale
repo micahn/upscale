@@ -195,7 +195,6 @@ selftest() {
   check p-home    "$(root_path_ok "$HOME"; echo $?)"          "1"
   check p-empty   "$(root_path_ok ""; echo $?)"               "1"
   check p-trailing "$(root_path_ok "$sandbox/a/b/"; echo $?)" "0"
-  rm -rf "$sandbox"
   # scratch dir lifecycle: created, private, removable, and never beside the input
   new_workdir
   check w-set     "$([[ -n $WORK && -d $WORK ]] && echo yes)" "yes"
@@ -204,8 +203,56 @@ selftest() {
   check w-clean   "$(rm -rf "$WORK"; [[ ! -e $WORK ]] && echo yes)" "yes"
   cleanup
   check w-cleared "$([[ -z $WORK ]] && echo yes)"            "yes"
+  # process_one must report failure, not exit, so a batch can continue
+  new_workdir
+  printf 'not an image' > "$sandbox/broken"
+  check po-missing "$(process_one "$sandbox/nope" "$sandbox/o.png" 100 100 /bin/false m 1 >/dev/null 2>&1; echo $?)" "1"
+  check po-broken  "$(process_one "$sandbox/broken" "$sandbox/o.png" 100 100 /bin/false m 1 >/dev/null 2>&1; echo $?)" "1"
+  check po-nodir   "$(process_one "$sandbox/a/b/mise" "$sandbox/o.png" 100 100 /bin/false m 1 >/dev/null 2>&1; echo $?)" "1"
+  check po-noinput "$(process_one "" "$sandbox/o.png" 100 100 /bin/false m 1 >/dev/null 2>&1; echo $?)" "1"
+  cleanup
+  rm -rf "$sandbox"
   (( f )) && { echo "selftest: FAILED"; return 1; }
   echo "selftest: ok"
+}
+
+# Process one input file. Returns non-zero on failure so that a batch can carry
+# on to the next file instead of aborting; the caller decides what to do about
+# the overall exit status.
+process_one() {
+  local f=$1 o=$2 tw=$3 th=$4 bin=$5 model=$6 nth=$7
+  local sw sh s tmp dims_in
+
+  [[ -f $f ]] || { printf 'upscale: no such file: %s  (did your glob match anything?)\n' "$f" >&2; return 1; }
+  # note: trailing \n is stripped by the command substitution, so this yields "W H"
+  if ! dims_in=$(magick identify -format "%w %h" "$f[0]"); then
+    printf 'upscale: cannot read image: %s\n' "$f" >&2
+    return 1
+  fi
+  read -r sw sh <<<"$dims_in"
+
+  s=$(pick_scale "$sw" "$sh" "$tw" "$th")
+  mkdir -p "$(dirname "$o")" || { printf 'upscale: cannot create %s\n' "$(dirname "$o")" >&2; return 1; }
+
+  if (( s == 1 )); then
+    # source already covers the target: no model run, nothing to clean up
+    tmp="$f"
+  else
+    # unique per file, so a batch cannot step on its own intermediates
+    tmp="$WORK/$nth.x${s}.png"
+    echo "upscale: $f  ${sw}x${sh} -> x${s} model -> ${tw}x${th}" >&2
+    if ! "$bin" -i "$f" -o "$tmp" -s "$s" -n "$model" >&2; then
+      printf 'upscale: model failed on %s\n' "$f" >&2
+      return 1
+    fi
+  fi
+  if ! magick "$tmp" -resize "${tw}x${th}^" -gravity center -extent "${tw}x${th}" "$o"; then
+    printf 'upscale: failed to write %s\n' "$o" >&2
+    return 1
+  fi
+  if [[ $tmp != "$f" ]]; then rm -f "$tmp"; fi
+  echo "upscale: wrote $o" >&2
+  return 0
 }
 
 main() {
@@ -251,35 +298,24 @@ main() {
 
   new_workdir
 
-  local f o sw sh s tmp i=0
+  # Every input is attempted, even if an earlier one failed: an unmatched glob
+  # in the middle of a list should not cost the user the whole batch. The exit
+  # status is still non-zero if anything failed, so scripts notice.
+  local f o i=0 failed=0
   for f in "${files[@]}"; do
     i=$((i + 1))
-    [[ -f $f ]] || die "no such file: $f  (did your glob match anything?)"
-    # note: trailing \n is stripped by the command substitution, so this yields "W H"
-    local dims_in
-    dims_in=$(magick identify -format "%w %h" "$f[0]") || die "cannot read image: $f"
-    read -r sw sh <<<"$dims_in"
-
-    s=$(pick_scale "$sw" "$sh" "$tw" "$th")
     if [[ -n $out ]]; then
       if (( ${#files[@]} > 1 )) || [[ -d $out ]]; then o="$out/${f%.*}-${spec,,}.png"
       else o="$out"; fi
     else o="${f%.*}-${spec,,}.png"; fi
-    mkdir -p "$(dirname "$o")"
-
-    if (( s == 1 )); then
-      # source already covers the target: no model run, nothing to clean up
-      tmp="$f"
-    else
-      # unique per file, so a batch cannot step on its own intermediates
-      tmp="$WORK/$i.x${s}.png"
-      echo "upscale: $f  ${sw}x${sh} -> x${s} model -> ${tw}x${th}" >&2
-      "$bin" -i "$f" -o "$tmp" -s "$s" -n "$model" >&2
-    fi
-    magick "$tmp" -resize "${tw}x${th}^" -gravity center -extent "${tw}x${th}" "$o"
-    if [[ $tmp != "$f" ]]; then rm -f "$tmp"; fi
-    echo "upscale: wrote $o" >&2
+    process_one "$f" "$o" "$tw" "$th" "$bin" "$model" "$i" || failed=1
   done
+
+  if (( failed )); then
+    printf 'upscale: finished with errors; some files were skipped (see above)\n' >&2
+    return 1
+  fi
+  return 0
 }
 
 main "$@"
