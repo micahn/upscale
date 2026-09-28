@@ -75,10 +75,22 @@ stretching, so a 4:3 source at 4K loses the top and bottom.
 
 ## Sandboxing
 
-Nothing is written outside `~/.local/share/upscale`. The script points mise's
-`MISE_DATA_DIR`, `MISE_CONFIG_DIR`, `MISE_STATE_DIR` and `MISE_CACHE_DIR` at a
-private subdirectory, so the model install never touches your normal mise
-installation or any system path.
+The model install never touches your normal mise installation or any system
+path. The script points mise's `MISE_DATA_DIR`, `MISE_CONFIG_DIR`,
+`MISE_STATE_DIR` and `MISE_CACHE_DIR` at a private subdirectory of
+`~/.local/share/upscale`, and that is the only thing stored there.
+
+Per-image intermediates do **not** go in the sandbox or next to your photos.
+Each run makes a private scratch directory under `$TMPDIR` (default `/tmp`),
+mode `700`, and removes it on exit — including on Ctrl-C or a crash:
+
+```sh
+TMPDIR=/somewhere/big upscale 8K huge.png    # move the scratch space
+```
+
+That keeps the input directory untouched, so read-only photo folders work, a
+failed run leaves nothing behind, and `upscale` can never overwrite a file that
+happens to be named like an intermediate.
 
 ```sh
 upscale uninstall   # deletes the sandbox and the script itself

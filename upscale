@@ -14,6 +14,25 @@ export MISE_CACHE_DIR="$ROOT/mise/cache"
 
 die() { printf 'upscale: %s\n' "$*" >&2; exit 1; }
 
+# Per-run scratch directory for model intermediates. Deliberately not next to
+# the input: that breaks read-only source directories, litters the user's photo
+# folder when a run dies, and can clobber a file that already exists there.
+WORK=""
+
+cleanup() {
+  [[ -n $WORK && -d $WORK ]] && rm -rf "$WORK"
+  WORK=""
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+new_workdir() {
+  WORK=$(mktemp -d "${TMPDIR:-/tmp}/upscale.XXXXXXXX") \
+    || die "cannot create a temp directory (check TMPDIR=${TMPDIR:-/tmp})"
+  chmod 700 "$WORK"
+}
+
 # "4K", "2k_uw", "4K-UW", "800x600" -> "W H"
 target_size() {
   local k="${1,,}"; k="${k//[-_]/}"
@@ -90,6 +109,14 @@ selftest() {
   check s-4       "$(pick_scale 200 120 800 480)"     "4"
   check s-4-max   "$(pick_scale 100 100 8000 8000)"   "4"
   check s-3       "$(pick_scale 400 300 1200 900)"    "3"
+  # scratch dir lifecycle: created, private, removable, and never beside the input
+  new_workdir
+  check w-set     "$([[ -n $WORK && -d $WORK ]] && echo yes)" "yes"
+  check w-mode    "$(stat -c %a "$WORK")"                     "700"
+  check w-tmp     "$([[ $WORK == "${TMPDIR:-/tmp}"/upscale.* ]] && echo yes)" "yes"
+  check w-clean   "$(rm -rf "$WORK"; [[ ! -e $WORK ]] && echo yes)" "yes"
+  cleanup
+  check w-cleared "$([[ -z $WORK ]] && echo yes)"            "yes"
   (( f )) && { echo "selftest: FAILED"; return 1; }
   echo "selftest: ok"
 }
@@ -127,8 +154,11 @@ main() {
 
   local bin; bin=$(ensure_tool)
 
-  local f o sw sh s tmp
+  new_workdir
+
+  local f o sw sh s tmp i=0
   for f in "${files[@]}"; do
+    i=$((i + 1))
     [[ -f $f ]] || die "no such file: $f  (did your glob match anything?)"
     # note: trailing \n is stripped by the command substitution, so this yields "W H"
     local dims_in
@@ -143,14 +173,16 @@ main() {
     mkdir -p "$(dirname "$o")"
 
     if (( s == 1 )); then
+      # source already covers the target: no model run, nothing to clean up
       tmp="$f"
     else
-      tmp="${f%.*}.x${s}.png"
+      # unique per file, so a batch cannot step on its own intermediates
+      tmp="$WORK/$i.x${s}.png"
       echo "upscale: $f  ${sw}x${sh} -> x${s} model -> ${tw}x${th}" >&2
       "$bin" -i "$f" -o "$tmp" -s "$s" -n "$model" >&2
     fi
     magick "$tmp" -resize "${tw}x${th}^" -gravity center -extent "${tw}x${th}" "$o"
-    [[ $tmp == "$f" ]] || rm -f "$tmp"
+    if [[ $tmp != "$f" ]]; then rm -f "$tmp"; fi
     echo "upscale: wrote $o" >&2
   done
 }
