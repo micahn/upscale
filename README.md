@@ -98,6 +98,12 @@ more resolution, the resample is a no-op and the output is pure model output.
 Output is always exactly `WxH`. Aspect ratio is preserved by cropping rather than
 stretching, so a 4:3 source at 4K loses the top and bottom.
 
+Phone and camera photos are stored rotated with an EXIF orientation tag, so their
+stored pixel grid is not the image you see — a portrait shot is often stored as
+4032x3024 and meant to display as 3024x4032. `upscale` applies the tag before
+measuring, so the scale factor and the model both see upright pixels. Images
+without a tag, or with orientation 1, are untouched.
+
 ## Sandboxing
 
 The model install never touches your normal mise installation or any system
