@@ -226,6 +226,14 @@ selftest() {
   # the bug: two dirs, same stem, one -o must collide rather than overwrite
   check op-clash1    "$(out_path a/photo.png o 4K 2)"              "o/photo-4k.png"
   check op-clash2    "$(out_path b/photo.png o 4K 2)"              "o/photo-4k.png"
+  # only an identity orientation may be taken at face value; a rotated tag means
+  # the stored grid is not what the user sees, and must not drive pick_scale
+  check ex-identity  "$(needs_orient Undefined; echo $?)"           "1"
+  check ex-top-left  "$(needs_orient TopLeft; echo $?)"             "1"
+  check ex-rot-90    "$(needs_orient RightTop; echo $?)"            "0"
+  check ex-rot-180   "$(needs_orient BottomRight; echo $?)"         "0"
+  check ex-rot-270   "$(needs_orient LeftBottom; echo $?)"          "0"
+  check ex-mirror    "$(needs_orient TopRight; echo $?)"            "0"
   rm -rf "$sandbox"
   (( f )) && { echo "selftest: FAILED"; return 1; }
   echo "selftest: ok"
@@ -256,32 +264,57 @@ out_path() {
   fi
 }
 
+# True when an EXIF orientation tag means the stored pixel grid is not the image
+# the viewer shows. TopLeft is orientation 1, the identity; Undefined is no tag.
+needs_orient() {
+  [[ $1 != Undefined && $1 != TopLeft ]]
+}
+
 # Process one input file. Returns non-zero on failure so that a batch can carry
 # on to the next file instead of aborting; the caller decides what to do about
 # the overall exit status.
 process_one() {
   local f=$1 o=$2 tw=$3 th=$4 bin=$5 model=$6 nth=$7
-  local sw sh s tmp dims_in
+  local sw sh s tmp src dims_in orient
 
   [[ -f $f ]] || { printf 'upscale: no such file: %s  (did your glob match anything?)\n' "$f" >&2; return 1; }
-  # note: trailing \n is stripped by the command substitution, so this yields "W H"
-  if ! dims_in=$(magick identify -format "%w %h" "$f[0]"); then
+  # One read gets the orientation tag and the stored grid. The trailing newline
+  # is stripped by the command substitution, so this yields "ORIENT W H".
+  if ! dims_in=$(magick identify -format "%[orientation] %w %h" "$f[0]"); then
     printf 'upscale: cannot read image: %s\n' "$f" >&2
     return 1
   fi
-  read -r sw sh <<<"$dims_in"
+  read -r orient sw sh <<<"$dims_in"
+
+  # A phone photo is stored rotated with an EXIF orientation tag, so its stored
+  # grid is not the image anyone sees: a 4032x3024 portrait is meant to display
+  # as 3024x4032. Anything other than the identity needs the tag applied before
+  # the dimensions are trusted, or the output comes out sideways.
+  src="$f"
+  if needs_orient "$orient"; then
+    if ! magick "$f[0]" -auto-orient "$WORK/$nth.oriented.png"; then
+      printf 'upscale: cannot read image: %s\n' "$f" >&2
+      return 1
+    fi
+    src="$WORK/$nth.oriented.png"
+    if ! dims_in=$(magick identify -format "%w %h" "$src"); then
+      printf 'upscale: cannot read image: %s\n' "$f" >&2
+      return 1
+    fi
+    read -r sw sh <<<"$dims_in"
+  fi
 
   s=$(pick_scale "$sw" "$sh" "$tw" "$th")
   mkdir -p "$(dirname "$o")" || { printf 'upscale: cannot create %s\n' "$(dirname "$o")" >&2; return 1; }
 
   if (( s == 1 )); then
     # source already covers the target: no model run, nothing to clean up
-    tmp="$f"
+    tmp="$src"
   else
     # unique per file, so a batch cannot step on its own intermediates
     tmp="$WORK/$nth.x${s}.png"
     echo "upscale: $f  ${sw}x${sh} -> x${s} model -> ${tw}x${th}" >&2
-    if ! "$bin" -i "$f" -o "$tmp" -s "$s" -n "$model" >&2; then
+    if ! "$bin" -i "$src" -o "$tmp" -s "$s" -n "$model" >&2; then
       printf 'upscale: model failed on %s\n' "$f" >&2
       return 1
     fi
@@ -290,7 +323,8 @@ process_one() {
     printf 'upscale: failed to write %s\n' "$o" >&2
     return 1
   fi
-  if [[ $tmp != "$f" ]]; then rm -f "$tmp"; fi
+  # only ever remove something we created inside the scratch dir
+  if [[ $tmp == "$WORK"/* ]]; then rm -f "$tmp"; fi
   echo "upscale: wrote $o" >&2
   return 0
 }
