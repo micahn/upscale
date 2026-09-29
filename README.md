@@ -48,6 +48,7 @@ all work. Anything matching `WxH` is used verbatim, so `800x600` is exact.
 -g ID     GPU device id, as seen by the Vulkan loader (default: auto)
 -t SIZE   tile size in pixels; lower it to fit large images
 -x        test-time augmentation: slower, slightly sharper
+-j N      run N files at once (default: 2; VRAM, not cores, is the limit)
 -y        proceed even when the source is too small to reach the target
 selftest  check the size and scale logic, no GPU needed
 uninstall remove the sandbox and this launcher
@@ -79,6 +80,27 @@ upscale 1080 ~/pics/*.jpg -o out/
 # wrote out/b-1080.png
 # finished with errors; some files were skipped (see above)
 ```
+
+### Batches
+
+A batch runs two files at a time by default. Real-ESRGAN is a single-image
+model, so the parallelism is whole images rather than a batched forward pass —
+which means **VRAM, not cores, is the limit**. Each concurrent job holds a full
+working set, so `-j nproc` will run out of memory long before it runs out of CPU.
+
+```sh
+upscale 4K ~/pics/*.jpg -j 1      # one at a time, for a small GPU
+upscale 4K ~/pics/*.jpg -j 4      # if you have the VRAM for it
+```
+
+Measured here on four 700x500 sources to 4K: 25.9s at `-j 1`, 14.6s at `-j 2`.
+`-j 4` was no faster than `-j 2` — the GPU is already saturated. If a job will
+not fit at all, `-t` (tile size) is the lever.
+
+Set `UPSCALE_JOBS` to change the default.
+
+Output is printed as each file finishes rather than in input order, but the lines
+for any one file stay together.
 
 ### Output format
 
