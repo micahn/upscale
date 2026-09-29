@@ -6,6 +6,7 @@ set -euo pipefail
 TOOL="github:xinntao/Real-ESRGAN@0.2.5.0"
 ROOT="${UPSCALE_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/upscale}"
 MODEL="${UPSCALE_MODEL:-realesr-animevideov3}"
+MAX_EDGE=16384   # largest width or height to attempt; beyond this is a typo or a joke
 
 export MISE_DATA_DIR="$ROOT/mise/data"
 export MISE_CONFIG_DIR="$ROOT/mise/config"
@@ -57,6 +58,23 @@ pick_scale() {
     if (( sw * c >= tw && sh * c >= th )); then echo "$c"; return; fi
   done
   echo 4
+}
+
+# Real-ESRGAN tops out at 4x. If even 4x misses the target, the shortfall is
+# made up by ImageMagick, which is an ordinary interpolation with none of the
+# detail the model exists to add. True when that is the case.
+model_undershoots() {
+  local sw=$1 sh=$2 tw=$3 th=$4
+  (( sw * 4 < tw || sh * 4 < th ))
+}
+
+# How much the final resize enlarges by, as a whole percentage, for a source at
+# sw x sh aiming at tw x th with the model clamped at 4x.
+blowup_pct() {
+  local sw=$1 sh=$2 tw=$3 th=$4 w h
+  w=$(( tw * 100 / (sw * 4) ))
+  h=$(( th * 100 / (sh * 4) ))
+  (( w > h )) && echo "$w" || echo "$h"
 }
 
 ensure_tool() {
@@ -154,6 +172,7 @@ size    720 1080 1440 2K 4K 8K   (16:9)
 options
   -o PATH   output file, or directory when several inputs
   -m NAME   realesr model (default: $MODEL)
+  -y        proceed even when the source is too small to reach the target
   selftest  check the size/scale logic, no GPU needed
   uninstall remove the sandbox, and the launcher if it looks installed
           -y, --yes  skip the confirmation prompt
@@ -206,10 +225,10 @@ selftest() {
   # process_one must report failure, not exit, so a batch can continue
   new_workdir
   printf 'not an image' > "$sandbox/broken"
-  check po-missing "$(process_one "$sandbox/nope" "$sandbox/o.png" 100 100 /bin/false m 1 >/dev/null 2>&1; echo $?)" "1"
-  check po-broken  "$(process_one "$sandbox/broken" "$sandbox/o.png" 100 100 /bin/false m 1 >/dev/null 2>&1; echo $?)" "1"
-  check po-nodir   "$(process_one "$sandbox/a/b/mise" "$sandbox/o.png" 100 100 /bin/false m 1 >/dev/null 2>&1; echo $?)" "1"
-  check po-noinput "$(process_one "" "$sandbox/o.png" 100 100 /bin/false m 1 >/dev/null 2>&1; echo $?)" "1"
+  check po-missing "$(process_one "$sandbox/nope" "$sandbox/o.png" 100 100 /bin/false m 1 0 >/dev/null 2>&1; echo $?)" "1"
+  check po-broken  "$(process_one "$sandbox/broken" "$sandbox/o.png" 100 100 /bin/false m 1 0 >/dev/null 2>&1; echo $?)" "1"
+  check po-nodir   "$(process_one "$sandbox/a/b/mise" "$sandbox/o.png" 100 100 /bin/false m 1 0 >/dev/null 2>&1; echo $?)" "1"
+  check po-noinput "$(process_one "" "$sandbox/o.png" 100 100 /bin/false m 1 0 >/dev/null 2>&1; echo $?)" "1"
   cleanup
   # out_path: the stem is a basename, and -o is a directory for batches
   check op-one-file  "$(out_path a/photo.png out.png 4K 1)"        "out.png"
@@ -234,6 +253,18 @@ selftest() {
   check ex-rot-180   "$(needs_orient BottomRight; echo $?)"         "0"
   check ex-rot-270   "$(needs_orient LeftBottom; echo $?)"          "0"
   check ex-mirror    "$(needs_orient TopRight; echo $?)"            "0"
+  # a source that cannot reach the target even at the 4x clamp
+  check un-tiny      "$(model_undershoots 100 100 7680 4320; echo $?)" "0"
+  check un-short-w   "$(model_undershoots 100 100 800 100; echo $?)"    "0"
+  check un-enough    "$(model_undershoots 1920 1080 3840 2160; echo $?)" "1"
+  check un-generous  "$(model_undershoots 4000 3000 1920 1080; echo $?)" "1"
+  # and the percentage the final Lanczos step has to make up
+  check bu-tiny-8k   "$(blowup_pct 100 100 7680 4320)"   "1920"
+  check bu-short     "$(blowup_pct 100 100 400 100)"     "100"
+  check bu-capped    "$(blowup_pct 1920 1080 7680 4320)" "100"
+  check bu-both      "$(blowup_pct 400 300 1600 1200)"   "100"
+  check bu-height    "$(blowup_pct 400 300 1600 6000)"   "500"
+  check bu-width     "$(blowup_pct 400 300 6000 1200)"   "375"
   rm -rf "$sandbox"
   (( f )) && { echo "selftest: FAILED"; return 1; }
   echo "selftest: ok"
@@ -274,7 +305,7 @@ needs_orient() {
 # on to the next file instead of aborting; the caller decides what to do about
 # the overall exit status.
 process_one() {
-  local f=$1 o=$2 tw=$3 th=$4 bin=$5 model=$6 nth=$7
+  local f=$1 o=$2 tw=$3 th=$4 bin=$5 model=$6 nth=$7 force=$8
   local sw sh s tmp src dims_in orient
 
   [[ -f $f ]] || { printf 'upscale: no such file: %s  (did your glob match anything?)\n' "$f" >&2; return 1; }
@@ -305,6 +336,18 @@ process_one() {
   fi
 
   s=$(pick_scale "$sw" "$sh" "$tw" "$th")
+  # Say so when the model cannot get there and Lanczos does the rest, rather
+  # than presenting a heavily interpolated result as an AI upscale.
+  if model_undershoots "$sw" "$sh" "$tw" "$th"; then
+    if (( force )); then
+      printf 'upscale: %s: %sx%s is small for %sx%s, %s%% interpolated\n' \
+        "$f" "$sw" "$sh" "$tw" "$th" "$(blowup_pct "$sw" "$sh" "$tw" "$th")" >&2
+    else
+      printf 'upscale: %s is only %sx%s; %sx%s is out of reach for the model,\n' "$f" "$sw" "$sh" "$tw" "$th" >&2
+      printf '  so %s%% of the final size is plain interpolation, not model detail.\n' "$(blowup_pct "$sw" "$sh" "$tw" "$th")" >&2
+      printf '  Pass --force if you want it anyway.\n' >&2
+    fi
+  fi
   mkdir -p "$(dirname "$o")" || { printf 'upscale: cannot create %s\n' "$(dirname "$o")" >&2; return 1; }
 
   if (( s == 1 )); then
@@ -348,12 +391,13 @@ main() {
     selftest) selftest; exit $? ;;
   esac
 
-  local spec="" out="" model="$MODEL"
+  local spec="" out="" model="$MODEL" force=0
   local -a files=()
   while (( $# )); do
     case "$1" in
       -o|--out)   [[ $# -ge 2 ]] || die "$1 needs a value"; out=$2; shift 2 ;;
       -m|--model) [[ $# -ge 2 ]] || die "$1 needs a value"; model=$2; shift 2 ;;
+      -y|--force) force=1; shift ;;
       -h|--help)  usage; exit 0 ;;
       --) shift; files+=("$@"); break ;;
       -*) die "unknown option $1" ;;
@@ -367,6 +411,11 @@ main() {
   local dims
   dims=$(target_size "$spec") || die "unknown size '$spec' (try 1080, 4K, 4KUW, 800x600)"
   local tw th; read -r tw th <<<"$dims"
+  if (( tw > MAX_EDGE || th > MAX_EDGE )); then
+    die "target ${tw}x${th} is larger than the ${MAX_EDGE}px limit on either axis
+  (that is a typo, or a target the model cannot approach from any real photo).
+  Use something up to ${MAX_EDGE}x${MAX_EDGE}."
+  fi
 
   local bin; bin=$(ensure_tool)
 
@@ -400,7 +449,7 @@ main() {
   i=0
   for f in "${files[@]}"; do
     i=$((i + 1))
-    process_one "$f" "${outs[i-1]}" "$tw" "$th" "$bin" "$model" "$i" || failed=1
+    process_one "$f" "${outs[i-1]}" "$tw" "$th" "$bin" "$model" "$i" "$force" || failed=1
   done
 
   if (( failed )); then
