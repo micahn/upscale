@@ -177,6 +177,7 @@ options
   -g ID     GPU device id, as seen by the Vulkan loader (default: auto)
   -t SIZE   tile size in pixels; lower it to fit large images
   -x        test-time augmentation: slower, slightly sharper
+  -j N      run N files at once (default: 2; VRAM, not cores, is the limit)
   -y        proceed even when the source is too small to reach the target
   selftest  check the size/scale logic, no GPU needed
   uninstall remove the sandbox, and the launcher if it looks installed
@@ -455,7 +456,7 @@ main() {
   esac
 
   local spec="" out="" model="$MODEL" force=0 fmt=png quality=""
-  local gpu="" tile=0 tta=0
+  local gpu="" tile=0 tta=0 jobs=${UPSCALE_JOBS:-2}
   local -a files=()
   while (( $# )); do
     case "$1" in
@@ -466,6 +467,7 @@ main() {
       -g|--gpu)   [[ $# -ge 2 ]] || die "$1 needs a value"; gpu=$2; shift 2 ;;
       -t|--tile)  [[ $# -ge 2 ]] || die "$1 needs a value"; tile=$2; shift 2 ;;
       -x|--tta)   tta=1; shift ;;
+      -j|--jobs)  [[ $# -ge 2 ]] || die "$1 needs a value"; jobs=$2; shift 2 ;;
       -y|--force) force=1; shift ;;
       -h|--help)  usage; exit 0 ;;
       --) shift; files+=("$@"); break ;;
@@ -479,6 +481,8 @@ main() {
     *) die "unsupported format '$fmt' (try png, jpg, webp, tiff)" ;;
   esac
   [[ -z $quality || $quality =~ ^[0-9]+$ ]] || die "-q needs a number (1-100)"
+  [[ $jobs =~ ^[0-9]+$ ]] || die "-j needs a number (1 or more)"
+  (( jobs >= 1 )) || die "-j must be at least 1"
   # This build of the binary cannot load models from outside its own models/
   # directory, so a path is refused up front rather than silently ignored.
   if [[ $model == */* || $model == *.param || $model == *.bin ]]; then
@@ -551,11 +555,37 @@ main() {
   # Every input is attempted, even if an earlier one failed: an unmatched glob
   # in the middle of a list should not cost the user the whole batch. The exit
   # status is still non-zero if anything failed, so scripts notice.
+  #
+  # Real-ESRGAN is a single-image model, so the parallelism is whole images
+  # rather than a batched forward pass. The limit is VRAM, not cores: each
+  # concurrent job holds a full working set, so -j is deliberately conservative
+  # and -t is the lever if a job cannot fit.
+  #
+  # Each file writes to its own log, and a log is printed when its job finishes,
+  # so concurrent output stays grouped per file instead of interleaving.
+  local bindir; bindir=$(dirname -- "$bin")
+  local -A logof=()          # pid -> log file
+  local -a live=()           # pids still running
+  local running=0 finished
   i=0
   for f in "${files[@]}"; do
     i=$((i + 1))
+    if (( running >= jobs )); then
+      wait -n -p finished || failed=1
+      running=$((running - 1))
+      [[ -n $finished && -n ${logof[$finished]:-} ]] && cat "${logof[$finished]}" >&2
+      unset "logof[$finished]"
+    fi
     process_one "$f" "${outs[i-1]}" "$tw" "$th" "$bin" "$model" "$i" "$force" \
-      "$gpu" "$tile" "$tta" "$quality" "$(dirname -- "$bin")" || failed=1
+      "$gpu" "$tile" "$tta" "$quality" "$bindir" > "$WORK/log.$i" 2>&1 &
+    logof[$!]="$WORK/log.$i"
+    live+=("$!")
+    running=$((running + 1))
+  done
+  # drain the rest, still in completion order
+  for p in "${live[@]}"; do
+    if wait "$p"; then :; else failed=1; fi
+    [[ -n ${logof[$p]:-} ]] && cat "${logof[$p]}" >&2
   done
 
   if (( failed )); then
