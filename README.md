@@ -121,6 +121,15 @@ internally, so they honour `-s 2` and `-s 3` as well. Verified on a 300x200
 source: `-s 2` gives 600x400, `-s 3` gives 900x600, `-s 4` gives 1200x800.
 Any model therefore works with whatever factor a target calls for.
 
+Four names are accepted: `realesr-animevideov3`, `realesrgan-x4plus`,
+`realesrgan-x4plus-anime` and `realesrnet-x4plus`. An unknown name is refused
+up front — given one, the binary prints a wall of `fopen` errors, exits 0, and
+writes an unpredictable image anyway.
+
+Custom or fine-tuned weights are **not** supported. This build of
+`realesrgan-ncnn-vulkan` only loads from its own `models/` directory, so a path
+is refused with an explanation rather than silently ignored.
+
 ## How exact sizes work
 
 Real-ESRGAN only does whole 2x/3x/4x. For any other size, `upscale` runs the model
