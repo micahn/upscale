@@ -230,10 +230,10 @@ selftest() {
   # process_one must report failure, not exit, so a batch can continue
   new_workdir
   printf 'not an image' > "$sandbox/broken"
-  check po-missing "$(process_one "$sandbox/nope" "$sandbox/o.png" 100 100 /bin/false m 1 0 "" 0 0 "" >/dev/null 2>&1; echo $?)" "1"
-  check po-broken  "$(process_one "$sandbox/broken" "$sandbox/o.png" 100 100 /bin/false m 1 0 "" 0 0 "" >/dev/null 2>&1; echo $?)" "1"
-  check po-nodir   "$(process_one "$sandbox/a/b/mise" "$sandbox/o.png" 100 100 /bin/false m 1 0 "" 0 0 "" >/dev/null 2>&1; echo $?)" "1"
-  check po-noinput "$(process_one "" "$sandbox/o.png" 100 100 /bin/false m 1 0 "" 0 0 "" >/dev/null 2>&1; echo $?)" "1"
+  check po-missing "$(process_one "$sandbox/nope" "$sandbox/o.png" 100 100 /bin/false m 1 0 "" 0 0 "" /nonexistent >/dev/null 2>&1; echo $?)" "1"
+  check po-broken  "$(process_one "$sandbox/broken" "$sandbox/o.png" 100 100 /bin/false m 1 0 "" 0 0 "" /nonexistent >/dev/null 2>&1; echo $?)" "1"
+  check po-nodir   "$(process_one "$sandbox/a/b/mise" "$sandbox/o.png" 100 100 /bin/false m 1 0 "" 0 0 "" /nonexistent >/dev/null 2>&1; echo $?)" "1"
+  check po-noinput "$(process_one "" "$sandbox/o.png" 100 100 /bin/false m 1 0 "" 0 0 "" /nonexistent >/dev/null 2>&1; echo $?)" "1"
   cleanup
   # out_path: the stem is a basename, and -o is a directory for batches
   check op-one-file  "$(out_path a/photo.png out.png 4K 1)"        "out.png"
@@ -312,17 +312,34 @@ needs_orient() {
   [[ $1 != Undefined && $1 != TopLeft ]]
 }
 
+# The model names this build of realesrgan-ncnn-vulkan accepts. The animevideov3
+# family ships as -x2/-x3/-x4 pairs, with the scale chosen by the binary.
+list_models() {
+  printf '%s ' realesr-animevideov3 realesrgan-x4plus \
+    realesrgan-x4plus-anime realesrnet-x4plus
+}
+
 # Process one input file. Returns non-zero on failure so that a batch can carry
 # on to the next file instead of aborting; the caller decides what to do about
 # the overall exit status.
 process_one() {
   local f=$1 o=$2 tw=$3 th=$4 bin=$5 model=$6 nth=$7 force=$8
-  local gpu=$9 tile=${10} tta=${11} quality=${12}
-  local sw sh s tmp src dims_in orient
+  local gpu=$9 tile=${10} tta=${11} quality=${12} bindir=${13}
+  local sw sh s tmp src dims_in orient frames
 
   [[ -f $f ]] || { printf 'upscale: no such file: %s  (did your glob match anything?)\n' "$f" >&2; return 1; }
+  # The frame count has to come from the file without a [0] selector: selecting
+  # frame 0 caps %n at 1, which is exactly the case worth detecting. identify
+  # emits one value per frame, so they are space-separated and the first is
+  # taken -- all frames of a GIF report the same count.
+  local allframes
+  if ! allframes=$(magick identify -format "%n " "$f" 2>/dev/null) || [[ -z ${allframes// /} ]]; then
+    printf 'upscale: cannot read image: %s\n' "$f" >&2
+    return 1
+  fi
+  frames=${allframes%% *}
   # One read gets the orientation tag and the stored grid. The trailing newline
-  # is stripped by the command substitution, so this yields "ORIENT W H".
+  # is stripped by the command substitution.
   if ! dims_in=$(magick identify -format "%[orientation] %w %h" "$f[0]"); then
     printf 'upscale: cannot read image: %s\n' "$f" >&2
     return 1
@@ -333,13 +350,23 @@ process_one() {
   # grid is not the image anyone sees: a 4032x3024 portrait is meant to display
   # as 3024x4032. Anything other than the identity needs the tag applied before
   # the dimensions are trusted, or the output comes out sideways.
+  #
+  # Multi-frame input is the same problem in a different form: the model is a
+  # still-image model, and passing an animated file to it makes it exit 0
+  # without writing anything, which surfaces as a confusing "failed to write".
+  # So the first frame is extracted to a real single-frame file, which is what
+  # gets scaled, and the user is told that is what happened.
   src="$f"
-  if needs_orient "$orient"; then
-    if ! magick "$f[0]" -auto-orient "$WORK/$nth.oriented.png"; then
+  if [[ $frames != 1 ]] || needs_orient "$orient"; then
+    if [[ $frames != 1 ]]; then
+      printf 'upscale: %s has %s frames; only the first is upscaled (no animation support)\n' \
+        "$f" "$frames" >&2
+    fi
+    if ! magick "$f[0]" -auto-orient "$WORK/$nth.frame.png"; then
       printf 'upscale: cannot read image: %s\n' "$f" >&2
       return 1
     fi
-    src="$WORK/$nth.oriented.png"
+    src="$WORK/$nth.frame.png"
     if ! dims_in=$(magick identify -format "%w %h" "$src"); then
       printf 'upscale: cannot read image: %s\n' "$f" >&2
       return 1
@@ -375,6 +402,18 @@ process_one() {
     echo "upscale: $f  ${sw}x${sh} -> x${s} model -> ${tw}x${th}" >&2
     # GPU device, tile size and TTA are passed through only when asked for, so
     # the binary keeps its own defaults otherwise.
+    # Only the four names this build of realesrgan-ncnn-vulkan documents work.
+    # It must be checked here rather than left to the binary: given a name it
+    # does not know, it prints a wall of fopen errors, exits 0, and writes an
+    # image anyway -- an unpredictable result reported as success.
+    case "$model" in
+      realesr-animevideov3|realesrgan-x4plus|realesrgan-x4plus-anime|realesrnet-x4plus) ;;
+      *)
+        printf 'upscale: no such model: %s\n' "$model" >&2
+        printf '  available: %s\n' "$(list_models "$bindir")" >&2
+        return 1
+        ;;
+    esac
     local -a opts=(-i "$src" -o "$tmp" -s "$s" -n "$model")
     [[ -n $gpu ]] && opts+=(-g "$gpu")
     [[ $tile != 0 ]] && opts+=(-t "$tile")
@@ -440,6 +479,14 @@ main() {
     *) die "unsupported format '$fmt' (try png, jpg, webp, tiff)" ;;
   esac
   [[ -z $quality || $quality =~ ^[0-9]+$ ]] || die "-q needs a number (1-100)"
+  # This build of the binary cannot load models from outside its own models/
+  # directory, so a path is refused up front rather than silently ignored.
+  if [[ $model == */* || $model == *.param || $model == *.bin ]]; then
+    die "this realesrgan-ncnn-vulkan build cannot load a model from a path.
+  Its -m option only accepts its own models/ directory, so only these work:
+    $(list_models)
+  Custom or fine-tuned weights would need a different build of the binary."
+  fi
 
   [[ -n $spec ]] || die "no target size given (try: upscale 4K photo.png)"
   (( ${#files[@]} )) || die "no input files given"
@@ -508,7 +555,7 @@ main() {
   for f in "${files[@]}"; do
     i=$((i + 1))
     process_one "$f" "${outs[i-1]}" "$tw" "$th" "$bin" "$model" "$i" "$force" \
-      "$gpu" "$tile" "$tta" "$quality" || failed=1
+      "$gpu" "$tile" "$tta" "$quality" "$(dirname -- "$bin")" || failed=1
   done
 
   if (( failed )); then
