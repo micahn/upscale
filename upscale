@@ -351,7 +351,11 @@ process_one() {
   mkdir -p "$(dirname "$o")" || { printf 'upscale: cannot create %s\n' "$(dirname "$o")" >&2; return 1; }
 
   if (( s == 1 )); then
-    # source already covers the target: no model run, nothing to clean up
+    # source already covers the target: no model run, nothing to clean up.
+    # Say so -- the tool is an AI upscaler, and silence here reads as a run
+    # that did nothing.
+    printf 'upscale: %s  %sx%s already covers %sx%s, resampling only (no model)\n' \
+      "$f" "$sw" "$sh" "$tw" "$th" >&2
     tmp="$src"
   else
     # unique per file, so a batch cannot step on its own intermediates
@@ -415,6 +419,28 @@ main() {
     die "target ${tw}x${th} is larger than the ${MAX_EDGE}px limit on either axis
   (that is a typo, or a target the model cannot approach from any real photo).
   Use something up to ${MAX_EDGE}x${MAX_EDGE}."
+  fi
+
+  # Check every input before ensure_tool, so a typo or an empty glob expansion is
+  # reported without first paying for a 47MB model download. Cheap checks here;
+  # the expensive ones stay in process_one where they can be per-file.
+  #
+  # A partly-bad batch is still run, because dropping the good files is exactly
+  # what the batch fix set out to stop. Only a wholly unusable argument list is
+  # fatal here, and there is no point installing a model to discover that.
+  local missing=()
+  for f in "${files[@]}"; do
+    [[ -f $f ]] || missing+=("$f")
+  done
+  if (( ${#missing[@]} == ${#files[@]} )); then
+    printf 'upscale: no such file:\n' >&2
+    printf '  %s\n' "${missing[@]}" >&2
+    printf '  (did your glob match anything?)\n' >&2
+    return 1
+  elif (( ${#missing[@]} )); then
+    printf 'upscale: %s of %s input(s) do not exist, continuing with the rest:\n' \
+      "${#missing[@]}" "${#files[@]}" >&2
+    printf '  %s\n' "${missing[@]}" >&2
   fi
 
   local bin; bin=$(ensure_tool)
