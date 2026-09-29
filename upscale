@@ -172,6 +172,11 @@ size    720 1080 1440 2K 4K 8K   (16:9)
 options
   -o PATH   output file, or directory when several inputs
   -m NAME   realesr model (default: $MODEL)
+  -f FMT    output format: png jpg webp tiff (default: png)
+  -q N      encoder quality, 1-100 (lossy formats)
+  -g ID     GPU device id, as seen by the Vulkan loader (default: auto)
+  -t SIZE   tile size in pixels; lower it to fit large images
+  -x        test-time augmentation: slower, slightly sharper
   -y        proceed even when the source is too small to reach the target
   selftest  check the size/scale logic, no GPU needed
   uninstall remove the sandbox, and the launcher if it looks installed
@@ -225,10 +230,10 @@ selftest() {
   # process_one must report failure, not exit, so a batch can continue
   new_workdir
   printf 'not an image' > "$sandbox/broken"
-  check po-missing "$(process_one "$sandbox/nope" "$sandbox/o.png" 100 100 /bin/false m 1 0 >/dev/null 2>&1; echo $?)" "1"
-  check po-broken  "$(process_one "$sandbox/broken" "$sandbox/o.png" 100 100 /bin/false m 1 0 >/dev/null 2>&1; echo $?)" "1"
-  check po-nodir   "$(process_one "$sandbox/a/b/mise" "$sandbox/o.png" 100 100 /bin/false m 1 0 >/dev/null 2>&1; echo $?)" "1"
-  check po-noinput "$(process_one "" "$sandbox/o.png" 100 100 /bin/false m 1 0 >/dev/null 2>&1; echo $?)" "1"
+  check po-missing "$(process_one "$sandbox/nope" "$sandbox/o.png" 100 100 /bin/false m 1 0 "" 0 0 "" >/dev/null 2>&1; echo $?)" "1"
+  check po-broken  "$(process_one "$sandbox/broken" "$sandbox/o.png" 100 100 /bin/false m 1 0 "" 0 0 "" >/dev/null 2>&1; echo $?)" "1"
+  check po-nodir   "$(process_one "$sandbox/a/b/mise" "$sandbox/o.png" 100 100 /bin/false m 1 0 "" 0 0 "" >/dev/null 2>&1; echo $?)" "1"
+  check po-noinput "$(process_one "" "$sandbox/o.png" 100 100 /bin/false m 1 0 "" 0 0 "" >/dev/null 2>&1; echo $?)" "1"
   cleanup
   # out_path: the stem is a basename, and -o is a directory for batches
   check op-one-file  "$(out_path a/photo.png out.png 4K 1)"        "out.png"
@@ -245,6 +250,12 @@ selftest() {
   # the bug: two dirs, same stem, one -o must collide rather than overwrite
   check op-clash1    "$(out_path a/photo.png o 4K 2)"              "o/photo-4k.png"
   check op-clash2    "$(out_path b/photo.png o 4K 2)"              "o/photo-4k.png"
+  # -f changes the extension, and the collision check keys off the full path,
+  # so a format cannot mask a clash
+  check op-fmt-jpg   "$(out_path a/photo.png o 4K 2 jpg)"          "o/photo-4k.jpg"
+  check op-fmt-webp  "$(out_path a/photo.png o 4K 2 webp)"         "o/photo-4k.webp"
+  check op-fmt-beside "$(out_path a/photo.png "" 4K 1 jpg)"        "a/photo-4k.jpg"
+  check op-fmt-clash "$(out_path a/photo.png o 4K 2 jpg)"          "$(out_path b/photo.png o 4K 2 jpg)"
   # only an identity orientation may be taken at face value; a rotated tag means
   # the stored grid is not what the user sees, and must not drive pick_scale
   check ex-identity  "$(needs_orient Undefined; echo $?)"           "1"
@@ -275,7 +286,7 @@ selftest() {
 # the input. The stem is the basename only -- using the whole path would mirror
 # the input's directory tree inside -o, which is not what anyone expects.
 out_path() {
-  local f=$1 out=$2 spec=$3 nfiles=$4 stem
+  local f=$1 out=$2 spec=$3 nfiles=$4 fmt=${5:-png} stem
   if [[ -n $out ]] && (( nfiles == 1 )) && [[ ! -d $out ]]; then
     printf %s "$out"
     return
@@ -288,10 +299,10 @@ out_path() {
     *)   stem=$base ;;
   esac
   if [[ -n $out ]]; then
-    printf '%s/%s-%s.png' "${out%/}" "$stem" "${spec,,}"
+    printf '%s/%s-%s.%s' "${out%/}" "$stem" "${spec,,}" "$fmt"
   else
     # beside the input: keep the directory, but the same stem rules apply
-    printf '%s/%s-%s.png' "$(dirname -- "$f")" "$stem" "${spec,,}"
+    printf '%s/%s-%s.%s' "$(dirname -- "$f")" "$stem" "${spec,,}" "$fmt"
   fi
 }
 
@@ -306,6 +317,7 @@ needs_orient() {
 # the overall exit status.
 process_one() {
   local f=$1 o=$2 tw=$3 th=$4 bin=$5 model=$6 nth=$7 force=$8
+  local gpu=$9 tile=${10} tta=${11} quality=${12}
   local sw sh s tmp src dims_in orient
 
   [[ -f $f ]] || { printf 'upscale: no such file: %s  (did your glob match anything?)\n' "$f" >&2; return 1; }
@@ -361,12 +373,20 @@ process_one() {
     # unique per file, so a batch cannot step on its own intermediates
     tmp="$WORK/$nth.x${s}.png"
     echo "upscale: $f  ${sw}x${sh} -> x${s} model -> ${tw}x${th}" >&2
-    if ! "$bin" -i "$src" -o "$tmp" -s "$s" -n "$model" >&2; then
+    # GPU device, tile size and TTA are passed through only when asked for, so
+    # the binary keeps its own defaults otherwise.
+    local -a opts=(-i "$src" -o "$tmp" -s "$s" -n "$model")
+    [[ -n $gpu ]] && opts+=(-g "$gpu")
+    [[ $tile != 0 ]] && opts+=(-t "$tile")
+    (( tta )) && opts+=(-x)
+    if ! "$bin" "${opts[@]}" >&2; then
       printf 'upscale: model failed on %s\n' "$f" >&2
       return 1
     fi
   fi
-  if ! magick "$tmp" -resize "${tw}x${th}^" -gravity center -extent "${tw}x${th}" "$o"; then
+  local -a mopts=("$tmp" -resize "${tw}x${th}^" -gravity center -extent "${tw}x${th}")
+  [[ -n $quality ]] && mopts=(-quality "$quality" "${mopts[@]}")
+  if ! magick "${mopts[@]}" "$o"; then
     printf 'upscale: failed to write %s\n' "$o" >&2
     return 1
   fi
@@ -395,12 +415,18 @@ main() {
     selftest) selftest; exit $? ;;
   esac
 
-  local spec="" out="" model="$MODEL" force=0
+  local spec="" out="" model="$MODEL" force=0 fmt=png quality=""
+  local gpu="" tile=0 tta=0
   local -a files=()
   while (( $# )); do
     case "$1" in
       -o|--out)   [[ $# -ge 2 ]] || die "$1 needs a value"; out=$2; shift 2 ;;
       -m|--model) [[ $# -ge 2 ]] || die "$1 needs a value"; model=$2; shift 2 ;;
+      -f|--format) [[ $# -ge 2 ]] || die "$1 needs a value"; fmt=${2,,}; shift 2 ;;
+      -q|--quality) [[ $# -ge 2 ]] || die "$1 needs a value"; quality=$2; shift 2 ;;
+      -g|--gpu)   [[ $# -ge 2 ]] || die "$1 needs a value"; gpu=$2; shift 2 ;;
+      -t|--tile)  [[ $# -ge 2 ]] || die "$1 needs a value"; tile=$2; shift 2 ;;
+      -x|--tta)   tta=1; shift ;;
       -y|--force) force=1; shift ;;
       -h|--help)  usage; exit 0 ;;
       --) shift; files+=("$@"); break ;;
@@ -408,6 +434,12 @@ main() {
       *)  if [[ -z $spec ]]; then spec=$1; else files+=("$1"); fi; shift ;;
     esac
   done
+
+  case "$fmt" in
+    png|jpg|jpeg|webp|tif|tiff) ;;
+    *) die "unsupported format '$fmt' (try png, jpg, webp, tiff)" ;;
+  esac
+  [[ -z $quality || $quality =~ ^[0-9]+$ ]] || die "-q needs a number (1-100)"
 
   [[ -n $spec ]] || die "no target size given (try: upscale 4K photo.png)"
   (( ${#files[@]} )) || die "no input files given"
@@ -454,7 +486,7 @@ main() {
   local -A seen_out=()
   local -a clashes=() outs=()
   for f in "${files[@]}"; do
-    o=$(out_path "$f" "$out" "$spec" "${#files[@]}")
+    o=$(out_path "$f" "$out" "$spec" "${#files[@]}" "$fmt")
     if [[ -n ${seen_out[$o]:-} ]]; then
       clashes+=("$o  <-  ${seen_out[$o]} and $f")
     else
@@ -475,7 +507,8 @@ main() {
   i=0
   for f in "${files[@]}"; do
     i=$((i + 1))
-    process_one "$f" "${outs[i-1]}" "$tw" "$th" "$bin" "$model" "$i" "$force" || failed=1
+    process_one "$f" "${outs[i-1]}" "$tw" "$th" "$bin" "$model" "$i" "$force" \
+      "$gpu" "$tile" "$tta" "$quality" || failed=1
   done
 
   if (( failed )); then
