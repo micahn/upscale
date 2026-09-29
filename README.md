@@ -43,6 +43,7 @@ all work. Anything matching `WxH` is used verbatim, so `800x600` is exact.
 ```
 -o PATH   output file, or a directory when you pass several inputs
 -m NAME   which Real-ESRGAN model (default: realesr-animevideov3)
+-y        proceed even when the source is too small to reach the target
 selftest  check the size and scale logic, no GPU needed
 uninstall remove the sandbox and this launcher
 ```
@@ -103,6 +104,23 @@ stored pixel grid is not the image you see — a portrait shot is often stored a
 4032x3024 and meant to display as 3024x4032. `upscale` applies the tag before
 measuring, so the scale factor and the model both see upright pixels. Images
 without a tag, or with orientation 1, are untouched.
+
+### When the source is too small
+
+Real-ESRGAN only does 2x, 3x and 4x. If your source is small enough that even
+4x misses the target, the shortfall is made up by ImageMagick, which is ordinary
+interpolation — none of the detail the model exists to add. `upscale` says so
+rather than presenting the result as an AI upscale:
+
+```sh
+upscale 8K tiny.png
+# upscale: tiny.png is only 100x100; 7680x4320 is out of reach for the model,
+#   so 1920% of the final size is plain interpolation, not model detail.
+#   Pass --force if you want it anyway.
+```
+
+`-y` (or `--force`) proceeds anyway with a one-line note. Targets are capped at
+16384px on an axis, since beyond that it is a typo rather than a request.
 
 ## Sandboxing
 
