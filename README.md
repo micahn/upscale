@@ -77,13 +77,17 @@ upscale 1080 ~/pics/*.jpg -o out/
 
 ### Models
 
-`realesr-animevideov3` is the default. It handles x2, x3 and x4, so it's the only
-one that works for every target. For photographs `realesrgan-x4plus` usually looks
-better but forces x4:
+`realesr-animevideov3` is the default, and is the smallest and fastest of the
+three. For photographs `realesrgan-x4plus` usually looks better:
 
 ```sh
 upscale 4K photo.jpg -m realesrgan-x4plus
 ```
+
+Only x4 weights ship for the `x4plus` models, but the binary rescales
+internally, so they honour `-s 2` and `-s 3` as well. Verified on a 300x200
+source: `-s 2` gives 600x400, `-s 3` gives 900x600, `-s 4` gives 1200x800.
+Any model therefore works with whatever factor a target calls for.
 
 ## How exact sizes work
 
