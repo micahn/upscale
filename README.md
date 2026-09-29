@@ -43,6 +43,11 @@ all work. Anything matching `WxH` is used verbatim, so `800x600` is exact.
 ```
 -o PATH   output file, or a directory when you pass several inputs
 -m NAME   which Real-ESRGAN model (default: realesr-animevideov3)
+-f FMT    output format: png jpg webp tiff (default: png)
+-q N      encoder quality, 1-100 (lossy formats)
+-g ID     GPU device id, as seen by the Vulkan loader (default: auto)
+-t SIZE   tile size in pixels; lower it to fit large images
+-x        test-time augmentation: slower, slightly sharper
 -y        proceed even when the source is too small to reach the target
 selftest  check the size and scale logic, no GPU needed
 uninstall remove the sandbox and this launcher
@@ -75,7 +80,34 @@ upscale 1080 ~/pics/*.jpg -o out/
 # finished with errors; some files were skipped (see above)
 ```
 
-### Models
+### Output format
+
+Output is PNG by default, which is lossless but large — a detailed 4K result is
+around 8.6MB. `-f` writes another format, and `-q` sets the encoder quality:
+
+```sh
+upscale 4K photo.jpg -f jpg -q 92      # ~1.3MB
+upscale 4K photo.jpg -f webp          # ~150KB
+upscale 4K photo.jpg -f tiff          # lossless, no PNG-style file size
+```
+
+`png`, `jpg`, `webp` and `tiff` are supported. Without `-q` each encoder uses its
+own default.
+
+### Model controls
+
+`realesrgan-ncnn-vulkan` takes more flags than `upscale` uses by default. These
+are passed through when given, and left to the binary's own defaults when not:
+
+```sh
+upscale 8K huge.png -t 128     # smaller tiles: fits large images on small GPUs
+upscale 4K photo.jpg -x        # test-time augmentation: ~1.9x slower, sharper
+upscale 4K photo.jpg -g 0      # pin a GPU device id as the Vulkan loader sees them
+```
+
+`auto` GPU selection is a good default on a hybrid-GPU laptop, but `-g` is the
+escape hatch when the discrete card is busy or the integrated part is what you
+want.
 
 `realesr-animevideov3` is the default, and is the smallest and fastest of the
 three. For photographs `realesrgan-x4plus` usually looks better:
