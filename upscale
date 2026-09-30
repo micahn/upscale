@@ -5,7 +5,7 @@ set -euo pipefail
 
 TOOL="github:xinntao/Real-ESRGAN@0.2.5.0"
 ROOT="${UPSCALE_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/upscale}"
-MODEL="${UPSCALE_MODEL:-realesr-animevideov3}"
+MODEL="${UPSCALE_MODEL:-realesrgan-x4plus}"   # general purpose; style neutral
 MAX_EDGE=16384   # largest width or height to attempt; beyond this is a typo or a joke
 
 export MISE_DATA_DIR="$ROOT/mise/data"
@@ -183,7 +183,7 @@ size    720 1080 1440 2K 4K 8K   (16:9)
 
 options
   -o PATH   output file, or directory when several inputs
-  -m NAME   realesr model (default: $MODEL)
+  -m NAME   realesr model (default: $MODEL; see: upscale models)
   -f FMT    output format: png jpg webp tiff (default: png)
   -q N      encoder quality, 1-100 (lossy formats)
   -g ID     GPU device id, as seen by the Vulkan loader (default: auto)
@@ -191,10 +191,18 @@ options
   -x        test-time augmentation: slower, slightly sharper
   -j N      run N files at once (default: 2; VRAM, not cores, is the limit)
   -y        proceed even when the source is too small to reach the target
-  selftest  check the size/scale logic, no GPU needed
+  models    list, install or remove models (see below)
+  selftest  check the logic, no GPU and no model needed
   uninstall remove the sandbox, and the launcher if it looks installed
           -y, --yes  skip the confirmation prompt
           --all      remove the launcher even outside a bin directory
+
+models
+  upscale models                     list installed and installable models
+  upscale models install NAME        fetch NAME from the pinned release
+  upscale models remove NAME         delete NAME to reclaim its disk
+
+$(models_help)
 EOF
 }
 
@@ -285,6 +293,69 @@ selftest() {
   # the bug: two dirs, same stem, one -o must collide rather than overwrite
   check op-clash1    "$(out_path a/photo.png o 4K 2)"              "o/photo-4k.png"
   check op-clash2    "$(out_path b/photo.png o 4K 2)"              "o/photo-4k.png"
+  # the model catalog: a name is installable only if it is in it, and installed
+  # only if its weights are on disk. Neither may be guessed from a hardcoded
+  # list -- realesr-animevideov3 has no bare .param, it ships -x2/-x3/-x4 pairs.
+  check cat-photo   "$(catalog_field realesrgan-x4plus 2)"          "photo"
+  check cat-anime   "$(catalog_field realesr-animevideov3 2)"       "anime"
+  check cat-note    "$(catalog_field realesrgan-x4plus-anime 3)"    "illustration and line art, larger weights"
+  check cat-bogus   "$(catalog_field nope 2; echo $?)"              "1"
+  check known-yes   "$(model_known realesrgan-x4plus; echo $?)"     "0"
+  check known-no    "$(model_known realesrnet-x4plus; echo $?)"     "1"
+  check known-bogus "$(model_known bogus; echo $?)"                 "1"
+  # model_present against a synthetic dir, so both weight layouts are covered
+  # whether or not this machine has the models installed
+  # Weights always come as a .param/.bin pair. A .param on its own is the
+  # dangerous half-present case, because the binary then writes an image anyway.
+  local mdir="$sandbox/models"; mkdir -p "$mdir"
+  local n
+  for n in realesrgan-x4plus.param realesrgan-x4plus.bin \
+           realesr-animevideov3-x2.param realesr-animevideov3-x2.bin; do
+    : > "$mdir/$n"
+  done
+  check mp-empty   "$(model_present "$mdir" nope; echo $?)"                "1"
+  check mp-bare    "$(model_present "$mdir" realesrgan-x4plus; echo $?)"    "0"
+  check mp-scale2  "$(model_present "$mdir" realesr-animevideov3 2; echo $?)" "0"
+  check mp-s-wrong "$(model_present "$mdir" realesr-animevideov3 4; echo $?)" "1"
+  check mp-any     "$(model_present "$mdir" realesr-animevideov3; echo $?)" "0"
+  check mp-other   "$(model_present "$mdir" realesrnet-x4plus; echo $?)"    "1"
+  # remove the .bin and it must stop counting as present
+  rm -f "$mdir/realesrgan-x4plus.bin"
+  check mp-half    "$(model_present "$mdir" realesrgan-x4plus; echo $?)"    "1"
+  : > "$mdir/realesrgan-x4plus.bin"
+  check mp-whole   "$(model_present "$mdir" realesrgan-x4plus; echo $?)"    "0"
+  check mf-one     "$(model_files "$mdir" realesrgan-x4plus | wc -l)"      "2"
+  : > "$mdir/realesr-animevideov3-x3.bin"
+  check mf-pair    "$(model_files "$mdir" realesr-animevideov3 | wc -l)"    "3"
+  # help lists the three installable models, and names the unavailable one
+  # separately so it is not mistaken for something that can be installed
+  check help-unav  "$(models_help | grep -c 'cannot be installed')"         "1"
+  # models remove is destructive, so exercise it on the throwaway dir
+  : > "$mdir/realesrgan-x4plus-anime.param"
+  : > "$mdir/realesrgan-x4plus-anime.bin"
+  check rm-bare    "$(remove_model_from "$mdir" realesrgan-x4plus)"         "2"
+  check rm-gone    "$(model_present "$mdir" realesrgan-x4plus; echo $?)"    "1"
+  check rm-untouched "$(model_present "$mdir" realesrgan-x4plus-anime; echo $?)" "0"
+  check rm-percale "$(remove_model_from "$mdir" realesr-animevideov3)"      "3"
+  check rm-scalegone "$(model_present "$mdir" realesr-animevideov3; echo $?)" "1"
+  check rm-none    "$(remove_model_from "$mdir" realesrnet-x4plus)"         "0"
+  # Both listings mark the default, and only when something is installed at all,
+  # so the expectations below branch on whether this machine has the models.
+  if [[ -n $(installed_models) ]]; then
+    check help-list  "$(models_help | grep -cE '^  (realesrgan|realesr-)')" "3"
+    check list-default "$(models_list | grep -cF "$MODEL *")"              "1"
+    check list-header  "$(models_list | grep -cE '^ +NAME +STYLE +SIZE +NOTE$')" "1"
+    check help-default "$(models_help | grep -c '<- default')"             "1"
+    check help-onmodel "$(models_help | grep -cF "$MODEL  (")"             "1"
+  else
+    check help-list  "$(models_help | grep -cE '^  (realesrgan|realesr-)')" "0"
+    check list-default "$(models_list | grep -cF "$MODEL *")"              "0"
+    check list-header  "$(models_list | grep -cE '^ +NAME +STYLE +SIZE +NOTE$')" "0"
+    check help-default "$(models_help | grep -c '<- default')"             "0"
+    check help-none    "$(models_help | grep -c 'none yet')"               "1"
+  fi
+  # the default must be style neutral, not an anime model
+  check default-photo "$([[ $MODEL == realesrgan-x4plus ]] && echo yes)" "yes"
   # The frame selector has to survive a filename that contains brackets itself.
   # ${f[0]} would delete the selector, which no single-frame test can see.
   check fr-plain     "$(frame0 photo.png)"         "photo.png[0]"
@@ -362,11 +433,246 @@ needs_orient() {
   [[ $1 != Undefined && $1 != TopLeft ]]
 }
 
-# The model names this build of realesrgan-ncnn-vulkan accepts. The animevideov3
-# family ships as -x2/-x3/-x4 pairs, with the scale chosen by the binary.
-list_models() {
-  printf '%s ' realesr-animevideov3 realesrgan-x4plus \
-    realesrgan-x4plus-anime realesrnet-x4plus
+# ---------------------------------------------------------------------------
+# Models
+#
+# The catalog is what the pinned Real-ESRGAN release actually ships, which is
+# the only source this build can install from. The ncnn binary only loads from
+# its own models/ directory -- its -m option accepts nothing else -- so a model
+# is either present there or it cannot be used at all.
+#
+# Fields are name, style, and a note. Style matters because the three are
+# tuned for very different material.
+# ---------------------------------------------------------------------------
+MODEL_CATALOG=(
+  "realesrgan-x4plus|photo|general purpose and style neutral; the default"
+  "realesrgan-x4plus-anime|anime|illustration and line art, larger weights"
+  "realesr-animevideov3|anime|video frames; smallest and fastest of the three"
+)
+
+# realesrnet-x4plus is a name the binary accepts, but the pinned release does
+# not ship its weights, so it cannot be installed from here.
+MODEL_UNAVAILABLE="realesrnet-x4plus"
+
+# The models/ directory inside the install, or nothing if not installed yet.
+# Deliberately does not trigger a download: listing models should be free.
+#
+# The ROOT check comes first because mise creates its own state, cache and
+# config directories the first time it is asked anything. Without it, `upscale
+# --help` on a machine that has never run upscale would leave a few kilobytes of
+# bookkeeping behind, which is a poor thing for a help command to do.
+models_dir() {
+  local d
+  [[ -d $ROOT ]] || return 1
+  d=$(mise where "$TOOL" 2>/dev/null) || return 1
+  [[ -d "$d/models" ]] || return 1
+  printf '%s' "$d/models"
+}
+
+# $1 = model name, $2 = 1 for style, 3 for the note (1 is the name itself).
+# Uses parameter expansion rather than cut: models_list calls this several times
+# per model, and a subshell and an external process each time is wasteful for
+# splitting one string.
+catalog_field() {
+  local e rest
+  for e in "${MODEL_CATALOG[@]}"; do
+    [[ ${e%%|*} == "$1" ]] || continue
+    rest=${e#*|}
+    case $2 in
+      1) printf '%s' "${e%%|*}" ;;
+      2) printf '%s' "${rest%%|*}" ;;
+      3) printf '%s' "${rest#*|}" ;;
+    esac
+    return 0
+  done
+  return 1
+}
+
+model_known() {  # in the installable catalog
+  local e
+  for e in "${MODEL_CATALOG[@]}"; do [[ ${e%%|*} == "$1" ]] && return 0; done
+  return 1
+}
+
+# True when the weights for $2 are in directory $1. With $3 given, that scale
+# must be the one present.
+#
+# Both the .param and the .bin must exist, not just the .param. A half-present
+# model is the dangerous case: the binary cannot open the .bin, prints a wall of
+# fopen errors, exits 0, and writes an unpredictable image -- so validating on
+# the .param alone would let exactly that through.
+#
+# Two layouts have to be accepted. The x4plus models ship one bare pair and the
+# binary rescales internally; the animevideov3 family ships -x2/-x3/-x4 pairs
+# and has no bare pair, with the scale chosen by the binary. Checking only the
+# .param also got animevideov3 wrong, since it has none.
+#
+# Kept separate from model_installed so it can be tested without an install.
+model_present() {
+  local d=$1 name=$2 scale=${3:-} base
+  for base in "$d/$name" $([[ -n $scale ]] && printf '%s' "$d/$name-x$scale"); do
+    [[ -e "$base.param" && -e "$base.bin" ]] && return 0
+  done
+  [[ -n $scale ]] && return 1
+  for base in "$d/$name"-x2 "$d/$name"-x3 "$d/$name"-x4; do
+    [[ -e "$base.param" && -e "$base.bin" ]] && return 0
+  done
+  return 1
+}
+
+model_installed() {
+  local d scale=${2:-}
+  d=$(models_dir) || return 1
+  model_present "$d" "$1" "$scale"
+}
+
+# Every weight file belonging to a model: a bare pair, or the per-scale set.
+model_files() {
+  local d=$1 name=$2 f
+  for f in "$d/$name.param" "$d/$name.bin" "$d/$name"-x*.param "$d/$name"-x*.bin; do
+    [[ -e $f ]] && printf '%s\n' "$f"
+  done
+}
+
+model_size() {  # installed size on disk, human-readable
+  local d=$1 name=$2 f total=0
+  while read -r f; do total=$((total + $(stat -c %s "$f"))); done < <(model_files "$d" "$name")
+  (( total == 0 )) && { echo "-"; return; }
+  if (( total >= 1048576 )); then printf '%sM' "$((total / 1048576))"
+  else printf '%sK' "$((total / 1024))"; fi
+}
+
+installed_models() {  # names only, one per line
+  local e
+  for e in "${MODEL_CATALOG[@]}"; do
+    model_installed "${e%%|*}" && printf '%s\n' "${e%%|*}"
+  done
+}
+
+# ---------------------------------------------------------------------------
+
+# `upscale models` -- what is installed, and what can be installed.
+do_models() {
+  local sub=${1:-list}
+  [[ $# -gt 0 ]] && shift
+  case "$sub" in
+    list|"")    models_list ;;
+    install)     models_install "$@" ;;
+    remove|rm)   models_remove "$@" ;;
+    -h|--help)   usage; return 0 ;;
+    *) die "unknown models subcommand: $sub (try: list, install, remove)" ;;
+  esac
+}
+
+models_list() {
+  local d e name any=1
+  if d=$(models_dir); then
+    printf 'installed in %s\n\n' "$d"
+    printf '  %-26s %-6s %-5s %s\n' NAME STYLE SIZE NOTE
+    for e in "${MODEL_CATALOG[@]}"; do
+      name=${e%%|*}
+      model_installed "$name" || continue
+      any=0
+      printf '  %-26s %-6s %-5s %s\n' \
+        "$name$([ "$name" = "$MODEL" ] && echo ' *')" \
+        "$(catalog_field "$name" 2)" "$(model_size "$d" "$name")" "$(catalog_field "$name" 3)"
+    done
+    (( any )) || printf '\n  * is the default for -m\n'
+  else
+    printf 'nothing installed yet; the first upscale run installs the model\n\n'
+  fi
+
+  printf '\nall models in the pinned release\n\n'
+  for e in "${MODEL_CATALOG[@]}"; do
+    name=${e%%|*}
+    if model_installed "$name"; then st=installed; else st='not installed'; fi
+    printf '  %-26s %-6s %s\n' "$name" "$(catalog_field "$name" 2)" "$st"
+  done
+  printf '\n  %-26s %-6s %s\n' "$MODEL_UNAVAILABLE" photo \
+    'not in the release; cannot be installed from here'
+  printf '\n  install: upscale models install NAME      remove: upscale models remove NAME\n'
+}
+
+# Restore one model by re-running the install ensure_tool uses, into a throwaway
+# mise data directory so it really downloads. That keeps one source of truth for
+# where models come from: the pinned GitHub release, not a second hardcoded URL.
+models_install() {
+  local name=${1:-} d tmp n=0
+  [[ -n $name ]] || die "which model? (try: upscale models install realesrgan-x4plus)"
+  model_known "$name" || die "'$name' is not an installable model.
+  the pinned release ships: $(printf '%s ' "${MODEL_CATALOG[@]%%|*}")"
+  model_installed "$name" && { printf 'upscale: %s is already installed\n' "$name"; return 0; }
+
+  d=$(models_dir) || { ensure_tool >/dev/null; d=$(models_dir) || die "cannot locate the models directory"; }
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/upscale-model.XXXXXXXX") || die "cannot create a temp directory"
+
+  printf 'upscale: downloading %s from the pinned Real-ESRGAN release\n' "$name" >&2
+
+  # The download and the copy run in a subshell so its scratch directory can be
+  # removed by a single-quoted EXIT trap that fires on every path out of it,
+  # including the error ones. Expanding $tmp at trap time is what makes that
+  # correct, and it is only in scope because the trap is inside the subshell.
+  n=$(
+    trap 'rm -rf "$tmp"' EXIT
+    MISE_DATA_DIR="$tmp/data" MISE_CONFIG_DIR="$tmp/config" \
+    MISE_STATE_DIR="$tmp/state" MISE_CACHE_DIR="$tmp/cache" \
+      mise install "$TOOL" >&2 || exit 1
+    src=$(find "$tmp/data/installs" -type d -name models -print -quit 2>/dev/null)
+    [[ -n $src ]] || exit 1
+    local copied=0 f
+    while read -r f; do cp -- "$f" "$d/" || exit 1; copied=$((copied + 1)); done \
+      < <(model_files "$src" "$name")
+    printf '%s' "$copied"
+  ) || die "could not fetch $name (download or copy failed; see above)"
+  (( n )) || die "$name turned out not to be in the release"
+  printf 'upscale: installed %s (%s, %s)\n' \
+    "$name" "$(catalog_field "$name" 2)" "$(model_size "$d" "$name")"
+}
+
+# Delete the weights for $2 from directory $1, printing how many files went.
+# Separate from models_remove so the destructive path can be tested against a
+# throwaway directory rather than the real install.
+remove_model_from() {
+  local d=$1 name=$2 f n=0
+  while read -r f; do rm -- "$f" && n=$((n + 1)); done < <(model_files "$d" "$name")
+  printf '%s' "$n"
+}
+
+models_remove() {
+  local name=${1:-} d n
+  [[ -n $name ]] || die "which model? (try: upscale models remove realesr-animevideov3)"
+  model_known "$name" || die "'$name' is not a known model"
+  d=$(models_dir) || die "no models are installed"
+  model_installed "$name" || die "$name is not installed"
+
+  n=$(remove_model_from "$d" "$name")
+  (( n )) || die "removed nothing"
+  printf 'upscale: removed %s (%s)\n' "$name" "$(catalog_field "$name" 2)"
+  if [[ $name == "$MODEL" ]]; then
+    printf 'upscale: %s is the default, so upscale will now report it missing.\n' "$name"
+    printf '         restore it with: upscale models install %s\n' "$name"
+  fi
+  return 0
+}
+
+# The model list for --help. Kept short: names and styles, not the whole table,
+# so the help stays readable. Lists only what is actually installed.
+models_help() {
+  local e name any=0 out=""
+  for e in "${MODEL_CATALOG[@]}"; do
+    name=${e%%|*}
+    model_installed "$name" || continue
+    any=1
+    out+="  $name  ($(catalog_field "$name" 2))"
+    [[ $name == "$MODEL" ]] && out+="  <- default"
+    out+=$'\n'
+  done
+  if (( any )); then
+    printf 'installed models\n%s' "$out"
+  else
+    printf 'installed models\n  (none yet; the first upscale run installs one)\n'
+  fi
+  printf '  %s  (not in the release; cannot be installed)\n' "$MODEL_UNAVAILABLE"
 }
 
 # Process one input file. Returns non-zero on failure so that a batch can carry
@@ -458,18 +764,23 @@ process_one() {
     echo "upscale: $f  ${sw}x${sh} -> x${s} model -> ${tw}x${th}" >&2
     # GPU device, tile size and TTA are passed through only when asked for, so
     # the binary keeps its own defaults otherwise.
-    # Only the four names this build of realesrgan-ncnn-vulkan documents work.
-    # It must be checked here rather than left to the binary: given a name it
-    # does not know, it prints a wall of fopen errors, exits 0, and writes an
-    # image anyway -- an unpredictable result reported as success.
-    case "$model" in
-      realesr-animevideov3|realesrgan-x4plus|realesrgan-x4plus-anime|realesrnet-x4plus) ;;
-      *)
-        printf 'upscale: no such model: %s\n' "$model" >&2
-        printf '  available: %s\n' "$(list_models "$bindir")" >&2
-        return 1
-        ;;
-    esac
+    # Checked here rather than left to the binary: given a name it does not
+    # know, it prints a wall of fopen errors, exits 0, and writes an image
+    # anyway -- an unpredictable result reported as success. It also accepts
+    # $MODEL_UNAVAILABLE, whose weights are not in the release, so presence on
+    # disk is the real test rather than membership of a list.
+    if ! model_known "$model"; then
+      printf 'upscale: no such model: %s\n' "$model" >&2
+      printf '  installed: %s\n' "$(installed_models | tr '\n' ' ')" >&2
+      printf '  see all of them with: upscale models\n' >&2
+      return 1
+    fi
+    if ! model_installed "$model" "$s"; then
+      printf 'upscale: model not installed: %s' "$model" >&2
+      printf ' (no x%s weights)\n' "$s" >&2
+      printf '  install it with: upscale models install %s\n' "$model" >&2
+      return 1
+    fi
     local -a opts=(-i "$src" -o "$tmp" -s "$s" -n "$model")
     [[ -n $gpu ]] && opts+=(-g "$gpu")
     [[ $tile != 0 ]] && opts+=(-t "$tile")
@@ -508,6 +819,7 @@ main() {
       do_uninstall "$assume_yes" "$force"
       exit 0 ;;
     selftest) selftest; exit $? ;;
+    models|model) shift; do_models "$@"; exit $? ;;
   esac
 
   local spec="" out="" model="$MODEL" force=0 fmt=png quality=""

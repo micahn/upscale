@@ -94,6 +94,39 @@ jobs:
       - name: selftest
         run: ./upscale selftest
 
+      # The assertions above run with no models installed, because this runner
+      # has no sandbox. Several assertions also branch on whether models are
+      # present, and getting that branch wrong is invisible from one side. So
+      # fabricate a sandbox with model weights in it and run the same suite
+      # again, which is the state a normal machine is in.
+      - name: selftest with models present
+        run: |
+          set -euo pipefail
+          curl -fsSL https://mise.run | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          sandbox="$RUNNER_TEMP/with-models"
+          install_dir="$sandbox/mise/data/installs/github-xinntao-real-esrgan/0.2.5.0"
+          mkdir -p "$install_dir/models" "$sandbox/mise/config"
+          printf '[tools]\n"github:xinntao/Real-ESRGAN" = "0.2.5.0"\n' \
+            > "$sandbox/mise/config/config.toml"
+          for m in realesrgan-x4plus realesrgan-x4plus-anime \
+                   realesr-animevideov3-x2 realesr-animevideov3-x3 \
+                   realesr-animevideov3-x4; do
+            : > "$install_dir/models/$m.param"
+            : > "$install_dir/models/$m.bin"
+          done
+          UPSCALE_HOME="$sandbox" ./upscale selftest
+
+          # The listings must reflect that sandbox. Captured before grepping,
+          # never piped: `upscale models | grep -q` dies of SIGPIPE, because
+          # grep -q exits on the first match and closes the pipe, and under
+          # pipefail the 141 is treated as a failure. Same trap as above.
+          listing=$(UPSCALE_HOME="$sandbox" ./upscale models)
+          grep -q 'realesrgan-x4plus' <<< "$listing"
+          helptext=$(UPSCALE_HOME="$sandbox" ./upscale --help)
+          grep -q 'installed models' <<< "$helptext"
+          echo "selftest passes in both states: no models, and models present"
+
       # SC1087 must stay fixed with braces, not silenced with a directive:
       # ${f[0]} deletes the ImageMagick frame selector, and that is invisible on
       # a single-frame JPEG. Keeping the file clean keeps the bad form loud.
@@ -122,9 +155,20 @@ jobs:
           expect "unsupported format"  ./upscale -f gif 4K /nonexistent.png
           expect "cannot load a model" ./upscale 4K /nonexistent.png -m /tmp/x.param
           expect "unknown size"        ./upscale 4QQ /nonexistent.png
+          # model management must reject bad names before touching the network
+          expect "not an installable model" ./upscale models install bogus
+          expect "not a known model"        ./upscale models remove bogus
+          expect "which model"              ./upscale models install
+          expect "which model"              ./upscale models remove
+          expect "unknown models subcommand" ./upscale models frobnicate
           ./upscale --help > /dev/null
+          ./upscale models > /dev/null
 
-          if [ -n "$(ls -A "$UPSCALE_HOME" 2>/dev/null)" ]; then
+          # Nothing above may have reached ensure_tool. Checked by looking for
+          # model weights, not by looking for an empty sandbox: asking mise
+          # anything creates its own bookkeeping directories, so "empty" was
+          # the wrong test and failed for a harmless reason.
+          if find "$UPSCALE_HOME" -name '*.param' -print -quit 2>/dev/null | grep -q .; then
             echo "  FAIL: reached ensure_tool and started a model install"; exit 1
           fi
 
@@ -173,7 +217,7 @@ jobs:
 
           # Nothing above may have needed the model, so nothing may have been
           # installed, and no scratch directory may survive the EXIT trap.
-          if [ -n "$(ls -A "$UPSCALE_HOME" 2>/dev/null)" ]; then
+          if find "$UPSCALE_HOME" -name '*.param' -print -quit 2>/dev/null | grep -q .; then
             echo "  FAIL: the run installed a model, so it needed the GPU after all"; exit 1
           fi
           if ls -d /tmp/upscale.* >/dev/null 2>&1; then
