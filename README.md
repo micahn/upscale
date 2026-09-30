@@ -42,7 +42,8 @@ all work. Anything matching `WxH` is used verbatim, so `800x600` is exact.
 
 ```
 -o PATH   output file, or a directory when you pass several inputs
--m NAME   which Real-ESRGAN model (default: realesr-animevideov3)
+-m NAME   which Real-ESRGAN model (default: realesrgan-x4plus)
+models    list, install or remove models
 -f FMT    output format: png jpg webp tiff (default: png)
 -q N      encoder quality, 1-100 (lossy formats)
 -g ID     GPU device id, as seen by the Vulkan loader (default: auto)
@@ -116,6 +117,43 @@ upscale 4K photo.jpg -f tiff          # lossless, no PNG-style file size
 `png`, `jpg`, `webp` and `tiff` are supported. Without `-q` each encoder uses its
 own default.
 
+### Models
+
+`realesrgan-x4plus` is the default. It is tuned for general photographic
+material, so it does not push anything towards a particular style. The other
+two are tuned for anime and illustration, and `upscale` will say which is which:
+
+```sh
+upscale models                              # what is installed, and what is not
+upscale models install realesrgan-x4plus    # fetch it from the pinned release
+upscale models remove realesr-animevideov3  # reclaim its disk
+upscale 4K photo.jpg -m realesr-animevideov3
+```
+
+| model | style | size | note |
+|---|---|---|---|
+| `realesrgan-x4plus` | photo | 31M | general purpose; the default |
+| `realesrgan-x4plus-anime` | anime | 8M | illustration and line art |
+| `realesr-animevideov3` | anime | 3M | video frames; smallest and fastest |
+
+All three honour `-s 2`, `-s 3` and `-s 4`; only the x4 weights ship, and the
+binary rescales internally. `upscale --help` lists the models installed on your
+machine.
+
+`realesrnet-x4plus` is a name the binary accepts, but the pinned release does
+not ship its weights, so it cannot be installed from here and `-m` will report
+it missing.
+
+Removing a model deletes its weights from the sandbox. `upscale models install`
+puts them back, from the same pinned GitHub release the first run uses, so there
+is only one source to reason about.
+
+The default changed from `realesr-animevideov3` to `realesrgan-x4plus` because
+an anime-tuned model is the wrong default for most images. The download is
+unchanged — all three models ship in the same release — so only the choice of
+model changed, not the size of the install. Use `UPSCALE_MODEL` or `-m` to go
+back.
+
 ### Model controls
 
 `realesrgan-ncnn-vulkan` takes more flags than `upscale` uses by default. These
@@ -131,22 +169,10 @@ upscale 4K photo.jpg -g 0      # pin a GPU device id as the Vulkan loader sees t
 escape hatch when the discrete card is busy or the integrated part is what you
 want.
 
-`realesr-animevideov3` is the default, and is the smallest and fastest of the
-three. For photographs `realesrgan-x4plus` usually looks better:
-
-```sh
-upscale 4K photo.jpg -m realesrgan-x4plus
-```
-
-Only x4 weights ship for the `x4plus` models, but the binary rescales
-internally, so they honour `-s 2` and `-s 3` as well. Verified on a 300x200
-source: `-s 2` gives 600x400, `-s 3` gives 900x600, `-s 4` gives 1200x800.
-Any model therefore works with whatever factor a target calls for.
-
-Four names are accepted: `realesr-animevideov3`, `realesrgan-x4plus`,
-`realesrgan-x4plus-anime` and `realesrnet-x4plus`. An unknown name is refused
-up front — given one, the binary prints a wall of `fopen` errors, exits 0, and
-writes an unpredictable image anyway.
+An unknown model name is refused up front, with the installed ones listed.
+Leaving that to the binary is not an option: given a name it does not know, it
+prints a wall of `fopen` errors, exits 0, and writes an unpredictable image
+anyway.
 
 Custom or fine-tuned weights are **not** supported. This build of
 `realesrgan-ncnn-vulkan` only loads from its own `models/` directory, so a path
@@ -227,9 +253,10 @@ Override the location with `UPSCALE_HOME`. Override the model with `UPSCALE_MODE
 
 ## Development
 
-`upscale selftest` runs 86 assertions over the size table, scale selection,
-output paths, the uninstall guard, the scratch directory, and the frame
-selector. It needs no GPU and no model install, and takes well under a second:
+`upscale selftest` runs 117 assertions over the size table, scale selection,
+output paths, the uninstall guard, the scratch directory, the frame selector,
+and the model catalog. It needs no GPU, no model install, and no network, and
+takes well under a second:
 
 ```sh
 ./upscale selftest

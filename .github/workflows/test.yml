@@ -122,7 +122,14 @@ jobs:
           expect "unsupported format"  ./upscale -f gif 4K /nonexistent.png
           expect "cannot load a model" ./upscale 4K /nonexistent.png -m /tmp/x.param
           expect "unknown size"        ./upscale 4QQ /nonexistent.png
+          # model management must reject bad names before touching the network
+          expect "not an installable model" ./upscale models install bogus
+          expect "not a known model"        ./upscale models remove bogus
+          expect "which model"              ./upscale models install
+          expect "which model"              ./upscale models remove
+          expect "unknown models subcommand" ./upscale models frobnicate
           ./upscale --help > /dev/null
+          ./upscale models > /dev/null
 
           if [ -n "$(ls -A "$UPSCALE_HOME" 2>/dev/null)" ]; then
             echo "  FAIL: reached ensure_tool and started a model install"; exit 1
