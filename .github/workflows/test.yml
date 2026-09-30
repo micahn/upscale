@@ -164,7 +164,11 @@ jobs:
           ./upscale --help > /dev/null
           ./upscale models > /dev/null
 
-          if [ -n "$(ls -A "$UPSCALE_HOME" 2>/dev/null)" ]; then
+          # Nothing above may have reached ensure_tool. Checked by looking for
+          # model weights, not by looking for an empty sandbox: asking mise
+          # anything creates its own bookkeeping directories, so "empty" was
+          # the wrong test and failed for a harmless reason.
+          if find "$UPSCALE_HOME" -name '*.param' -print -quit 2>/dev/null | grep -q .; then
             echo "  FAIL: reached ensure_tool and started a model install"; exit 1
           fi
 
@@ -213,7 +217,7 @@ jobs:
 
           # Nothing above may have needed the model, so nothing may have been
           # installed, and no scratch directory may survive the EXIT trap.
-          if [ -n "$(ls -A "$UPSCALE_HOME" 2>/dev/null)" ]; then
+          if find "$UPSCALE_HOME" -name '*.param' -print -quit 2>/dev/null | grep -q .; then
             echo "  FAIL: the run installed a model, so it needed the GPU after all"; exit 1
           fi
           if ls -d /tmp/upscale.* >/dev/null 2>&1; then

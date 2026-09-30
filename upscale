@@ -456,8 +456,14 @@ MODEL_UNAVAILABLE="realesrnet-x4plus"
 
 # The models/ directory inside the install, or nothing if not installed yet.
 # Deliberately does not trigger a download: listing models should be free.
+#
+# The ROOT check comes first because mise creates its own state, cache and
+# config directories the first time it is asked anything. Without it, `upscale
+# --help` on a machine that has never run upscale would leave a few kilobytes of
+# bookkeeping behind, which is a poor thing for a help command to do.
 models_dir() {
   local d
+  [[ -d $ROOT ]] || return 1
   d=$(mise where "$TOOL" 2>/dev/null) || return 1
   [[ -d "$d/models" ]] || return 1
   printf '%s' "$d/models"
