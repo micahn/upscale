@@ -305,28 +305,39 @@ selftest() {
   check known-bogus "$(model_known bogus; echo $?)"                 "1"
   # model_present against a synthetic dir, so both weight layouts are covered
   # whether or not this machine has the models installed
+  # Weights always come as a .param/.bin pair. A .param on its own is the
+  # dangerous half-present case, because the binary then writes an image anyway.
   local mdir="$sandbox/models"; mkdir -p "$mdir"
-  check mp-empty   "$(model_present "$mdir" realesrgan-x4plus; echo $?)"    "1"
-  : > "$mdir/realesrgan-x4plus.param"
+  local n
+  for n in realesrgan-x4plus.param realesrgan-x4plus.bin \
+           realesr-animevideov3-x2.param realesr-animevideov3-x2.bin; do
+    : > "$mdir/$n"
+  done
+  check mp-empty   "$(model_present "$mdir" nope; echo $?)"                "1"
   check mp-bare    "$(model_present "$mdir" realesrgan-x4plus; echo $?)"    "0"
-  check mp-scale0  "$(model_present "$mdir" realesr-animevideov3; echo $?)" "1"
-  : > "$mdir/realesr-animevideov3-x2.param"
-  check mp-scale   "$(model_present "$mdir" realesr-animevideov3; echo $?)" "0"
+  check mp-scale2  "$(model_present "$mdir" realesr-animevideov3 2; echo $?)" "0"
+  check mp-s-wrong "$(model_present "$mdir" realesr-animevideov3 4; echo $?)" "1"
+  check mp-any     "$(model_present "$mdir" realesr-animevideov3; echo $?)" "0"
   check mp-other   "$(model_present "$mdir" realesrnet-x4plus; echo $?)"    "1"
-  check mf-one     "$(model_files "$mdir" realesrgan-x4plus | wc -l)"      "1"
+  # remove the .bin and it must stop counting as present
+  rm -f "$mdir/realesrgan-x4plus.bin"
+  check mp-half    "$(model_present "$mdir" realesrgan-x4plus; echo $?)"    "1"
+  : > "$mdir/realesrgan-x4plus.bin"
+  check mp-whole   "$(model_present "$mdir" realesrgan-x4plus; echo $?)"    "0"
+  check mf-one     "$(model_files "$mdir" realesrgan-x4plus | wc -l)"      "2"
   : > "$mdir/realesr-animevideov3-x3.bin"
-  check mf-pair    "$(model_files "$mdir" realesr-animevideov3 | wc -l)"    "2"
+  check mf-pair    "$(model_files "$mdir" realesr-animevideov3 | wc -l)"    "3"
   # help lists the three installable models, and names the unavailable one
   # separately so it is not mistaken for something that can be installed
   check help-list  "$(models_help | grep -cE '^  (realesrgan|realesr-)')"   "3"
   check help-unav  "$(models_help | grep -c 'cannot be installed')"         "1"
   # models remove is destructive, so exercise it on the throwaway dir
-  : > "$mdir/realesrgan-x4plus.bin"
   : > "$mdir/realesrgan-x4plus-anime.param"
+  : > "$mdir/realesrgan-x4plus-anime.bin"
   check rm-bare    "$(remove_model_from "$mdir" realesrgan-x4plus)"         "2"
   check rm-gone    "$(model_present "$mdir" realesrgan-x4plus; echo $?)"    "1"
   check rm-untouched "$(model_present "$mdir" realesrgan-x4plus-anime; echo $?)" "0"
-  check rm-percale "$(remove_model_from "$mdir" realesr-animevideov3)"      "2"
+  check rm-percale "$(remove_model_from "$mdir" realesr-animevideov3)"      "3"
   check rm-scalegone "$(model_present "$mdir" realesr-animevideov3; echo $?)" "1"
   check rm-none    "$(remove_model_from "$mdir" realesrnet-x4plus)"         "0"
   # Both listings mark the default, and only when something is installed at all,
@@ -472,21 +483,36 @@ model_known() {  # in the installable catalog
   return 1
 }
 
-# True when the weights for $2 are in directory $1. The animevideov3 family ships
-# as -x2/-x3/-x4 pairs and has no bare .param, with the scale chosen by the
-# binary, so both layouts have to be accepted. Kept separate from
-# model_installed so it can be tested without an install present.
+# True when the weights for $2 are in directory $1. With $3 given, that scale
+# must be the one present.
+#
+# Both the .param and the .bin must exist, not just the .param. A half-present
+# model is the dangerous case: the binary cannot open the .bin, prints a wall of
+# fopen errors, exits 0, and writes an unpredictable image -- so validating on
+# the .param alone would let exactly that through.
+#
+# Two layouts have to be accepted. The x4plus models ship one bare pair and the
+# binary rescales internally; the animevideov3 family ships -x2/-x3/-x4 pairs
+# and has no bare pair, with the scale chosen by the binary. Checking only the
+# .param also got animevideov3 wrong, since it has none.
+#
+# Kept separate from model_installed so it can be tested without an install.
 model_present() {
-  local d=$1 name=$2 f
-  [[ -e "$d/$name.param" ]] && return 0
-  for f in "$d/$name"-x*.param; do [[ -e $f ]] && return 0; done
+  local d=$1 name=$2 scale=${3:-} base
+  for base in "$d/$name" $([[ -n $scale ]] && printf '%s' "$d/$name-x$scale"); do
+    [[ -e "$base.param" && -e "$base.bin" ]] && return 0
+  done
+  [[ -n $scale ]] && return 1
+  for base in "$d/$name"-x2 "$d/$name"-x3 "$d/$name"-x4; do
+    [[ -e "$base.param" && -e "$base.bin" ]] && return 0
+  done
   return 1
 }
 
 model_installed() {
-  local d
+  local d scale=${2:-}
   d=$(models_dir) || return 1
-  model_present "$d" "$1"
+  model_present "$d" "$1" "$scale"
 }
 
 # Every weight file belonging to a model: a bare pair, or the per-scale set.
@@ -560,7 +586,7 @@ models_list() {
 # mise data directory so it really downloads. That keeps one source of truth for
 # where models come from: the pinned GitHub release, not a second hardcoded URL.
 models_install() {
-  local name=${1:-} d tmp src f n=0
+  local name=${1:-} d tmp n=0
   [[ -n $name ]] || die "which model? (try: upscale models install realesrgan-x4plus)"
   model_known "$name" || die "'$name' is not an installable model.
   the pinned release ships: $(printf '%s ' "${MODEL_CATALOG[@]%%|*}")"
@@ -568,21 +594,25 @@ models_install() {
 
   d=$(models_dir) || { ensure_tool >/dev/null; d=$(models_dir) || die "cannot locate the models directory"; }
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/upscale-model.XXXXXXXX") || die "cannot create a temp directory"
-  # shellcheck disable=SC2064  # expand $tmp now, not when the trap fires
-  trap "rm -rf '$tmp'" RETURN
 
   printf 'upscale: downloading %s from the pinned Real-ESRGAN release\n' "$name" >&2
-  MISE_DATA_DIR="$tmp/data" MISE_CONFIG_DIR="$tmp/config" \
-  MISE_STATE_DIR="$tmp/state" MISE_CACHE_DIR="$tmp/cache" \
-    mise install "$TOOL" >&2 || die "download failed"
 
-  src=$(find "$tmp/data/installs" -type d -name models -print -quit 2>/dev/null)
-  [[ -n $src ]] || die "download finished but it contained no models"
-
-  while read -r f; do
-    cp -- "$f" "$d/" || die "cannot write to $d"
-    n=$((n + 1))
-  done < <(model_files "$src" "$name")
+  # The download and the copy run in a subshell so its scratch directory can be
+  # removed by a single-quoted EXIT trap that fires on every path out of it,
+  # including the error ones. Expanding $tmp at trap time is what makes that
+  # correct, and it is only in scope because the trap is inside the subshell.
+  n=$(
+    trap 'rm -rf "$tmp"' EXIT
+    MISE_DATA_DIR="$tmp/data" MISE_CONFIG_DIR="$tmp/config" \
+    MISE_STATE_DIR="$tmp/state" MISE_CACHE_DIR="$tmp/cache" \
+      mise install "$TOOL" >&2 || exit 1
+    src=$(find "$tmp/data/installs" -type d -name models -print -quit 2>/dev/null)
+    [[ -n $src ]] || exit 1
+    local copied=0 f
+    while read -r f; do cp -- "$f" "$d/" || exit 1; copied=$((copied + 1)); done \
+      < <(model_files "$src" "$name")
+    printf '%s' "$copied"
+  ) || die "could not fetch $name (download or copy failed; see above)"
   (( n )) || die "$name turned out not to be in the release"
   printf 'upscale: installed %s (%s, %s)\n' \
     "$name" "$(catalog_field "$name" 2)" "$(model_size "$d" "$name")"
@@ -734,8 +764,9 @@ process_one() {
       printf '  see all of them with: upscale models\n' >&2
       return 1
     fi
-    if ! model_installed "$model"; then
-      printf 'upscale: model not installed: %s\n' "$model" >&2
+    if ! model_installed "$model" "$s"; then
+      printf 'upscale: model not installed: %s' "$model" >&2
+      printf ' (no x%s weights)\n' "$s" >&2
       printf '  install it with: upscale models install %s\n' "$model" >&2
       return 1
     fi
