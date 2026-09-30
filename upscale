@@ -341,7 +341,12 @@ process_one() {
   frames=${allframes%% *}
   # One read gets the orientation tag and the stored grid. The trailing newline
   # is stripped by the command substitution.
-  if ! dims_in=$(magick identify -format "%[orientation] %w %h" "$f[0]"); then
+  #
+  # The [0] on the filename is an ImageMagick frame selector, not a bash array
+  # index, and must be written as ${f}[0]. shellcheck's other suggestion,
+  # ${f[0]}, makes bash eat the selector instead of passing it on -- a change
+  # that is invisible for a single-frame JPEG and silently breaks animations.
+  if ! dims_in=$(magick identify -format "%[orientation] %w %h" "${f}[0]"); then
     printf 'upscale: cannot read image: %s\n' "$f" >&2
     return 1
   fi
@@ -363,7 +368,8 @@ process_one() {
       printf 'upscale: %s has %s frames; only the first is upscaled (no animation support)\n' \
         "$f" "$frames" >&2
     fi
-    if ! magick "$f[0]" -auto-orient "$WORK/$nth.frame.png"; then
+    # ${f}[0], not ${f[0]} -- see the note at the read above.
+    if ! magick "${f}[0]" -auto-orient "$WORK/$nth.frame.png"; then
       printf 'upscale: cannot read image: %s\n' "$f" >&2
       return 1
     fi
