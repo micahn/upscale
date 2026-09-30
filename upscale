@@ -569,7 +569,24 @@ main() {
     printf '  %s\n' "${missing[@]}" >&2
   fi
 
-  local bin; bin=$(ensure_tool)
+  # The model is only needed if some input is actually smaller than its target.
+  # On the scale-1 path it is never invoked, so a pure downscale should not pay
+  # for a 47MB install. Dimensions are read exactly as process_one reads them --
+  # displayed, not stored -- so this pre-scan cannot disagree with the decision
+  # it is predicting. An unreadable file is left to process_one to report.
+  local need_model=0 sw sh dims_probe
+  for f in "${files[@]}"; do
+    [[ -f $f ]] || continue
+    dims_probe=$(magick identify -auto-orient -format "%w %h" "$(frame0 "$f")" 2>/dev/null) || continue
+    read -r sw sh <<<"$dims_probe"
+    (( sw >= tw && sh >= th )) || need_model=1
+  done
+
+  local bin="" bindir=""
+  if (( need_model )); then
+    bin=$(ensure_tool)
+    bindir=$(dirname -- "$bin")
+  fi
 
   new_workdir
 
@@ -606,7 +623,6 @@ main() {
   #
   # Each file writes to its own log, and a log is printed when its job finishes,
   # so concurrent output stays grouped per file instead of interleaving.
-  local bindir; bindir=$(dirname -- "$bin")
   local -A logof=()          # pid -> log file
   local -a live=()           # pids still running
   local running=0 finished

@@ -10,19 +10,38 @@ permissions:
   contents: read
 
 jobs:
-  selftest:
-    name: selftest and shellcheck
+  test:
+    name: selftest, shellcheck, end to end
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # selftest shells out to magick, and refuses to run without it rather
-      # than passing vacuously, so this is a hard requirement, not a nicety.
-      - name: install ImageMagick
+      # selftest shells out to magick and refuses to run without it, rather than
+      # passing vacuously, so this is a hard requirement rather than a nicety.
+      - name: install ImageMagick and shellcheck
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq imagemagick
+          sudo apt-get install -y -qq imagemagick shellcheck
           magick -version | head -1
+          shellcheck --version | head -2
+
+      # upscale exits non-zero for every one of the cases checked below, so its
+      # output must be captured before grepping. `upscale ... | grep -q` fails
+      # under pipefail even when grep matches, because the left side exits 1.
+      - name: helpers
+        run: |
+          cat > "$RUNNER_TEMP/expect.sh" <<'SH'
+          expect() {
+            local want=$1; shift
+            local got rc
+            got=$("$@" 2>&1) && rc=0 || rc=$?
+            case "$got" in
+              *"$want"*) printf '  ok (exit %s): %s\n' "$rc" "$*" ;;
+              *) printf '  FAIL: %s\n    wanted [%s] in:\n%s\n' "$*" "$want" "$got"; exit 1 ;;
+            esac
+          }
+          dims() { magick identify -format '%wx%h' "$1"; }
+          SH
 
       - name: bash syntax
         run: bash -n upscale
@@ -30,65 +49,83 @@ jobs:
       - name: selftest
         run: ./upscale selftest
 
-      # SC1087 must stay suppressed-by-braces, not silenced by a directive:
-      # ${f[0]} deletes the ImageMagick frame selector and is invisible on a
-      # single-frame JPEG. Keep the whole file clean so the bad form is loud.
+      # SC1087 must stay fixed with braces, not silenced with a directive:
+      # ${f[0]} deletes the ImageMagick frame selector, and that is invisible on
+      # a single-frame JPEG. Keeping the file clean keeps the bad form loud.
       - name: shellcheck
         run: |
-          sudo apt-get install -y -qq shellcheck
           shellcheck upscale
-          echo "no shellcheck disable directives allowed:"
-          ! grep -n 'shellcheck disable' upscale || { echo "found one"; exit 1; }
+          if grep -n 'shellcheck disable' upscale; then
+            echo "a shellcheck disable directive was found; fix the code instead"; exit 1
+          fi
 
-      # A real end-to-end run is not possible here: GitHub's runners have no
-      # Vulkan GPU, so realesrgan-ncnn-vulkan cannot run. What is checked is
-      # everything that happens before the model is invoked.
-      #
-      # None of these may reach ensure_tool, or the run would pull a 47MB
-      # model install. The sandbox is asserted empty afterwards to prove it.
+      # Everything that happens before the model is invoked. None of these may
+      # reach ensure_tool, or the run would pull a 47MB model install, so the
+      # sandbox is asserted empty afterwards to prove it did not.
       - name: argument handling without a GPU
         run: |
           set -euo pipefail
-          export UPSCALE_HOME="$RUNNER_TEMP/fresh-sandbox"
-          ./upscale --help > /dev/null
-          ./upscale 4K 2>&1 | grep -q "no input files"
-          ./upscale 4K /nonexistent.png 2>&1 | grep -q "no such file"
-          ./upscale 99999x99999 /nonexistent.png 2>&1 | grep -q "16384px limit"
-          ./upscale 4K /nonexistent.png -o dir 2>&1 | grep -q "no such file"
-          ./upscale -j 0 4K /nonexistent.png 2>&1 | grep -q "at least 1"
-          if [ -n "$(ls -A "$UPSCALE_HOME" 2>/dev/null)" ]; then
-            echo "reached ensure_tool and started a model install:"; exit 1
-          fi
-          echo "argument handling ok, and no model install was triggered"
+          . "$RUNNER_TEMP/expect.sh"
+          export UPSCALE_HOME="$RUNNER_TEMP/arg-sandbox"
 
-      # A real end-to-end run is possible after all, on the scale-1 path: a
-      # source that already covers the target skips the model entirely. This
-      # covers the whole pipeline -- frame selector, cover-crop, output naming --
-      # and proves the EXIT trap removes the scratch directory.
-      - name: end-to-end on the scale-1 path
+          expect "no input files"      ./upscale 4K
+          expect "no such file"        ./upscale 4K /nonexistent.png
+          expect "no such file"        ./upscale 4K /nonexistent.png -o dir
+          expect "16384px limit"       ./upscale 99999x99999 /nonexistent.png
+          expect "at least 1"          ./upscale -j 0 4K /nonexistent.png
+          expect "needs a number"      ./upscale -j x 4K /nonexistent.png
+          expect "unsupported format"  ./upscale -f gif 4K /nonexistent.png
+          expect "cannot load a model" ./upscale 4K /nonexistent.png -m /tmp/x.param
+          expect "unknown size"        ./upscale 4QQ /nonexistent.png
+          ./upscale --help > /dev/null
+
+          if [ -n "$(ls -A "$UPSCALE_HOME" 2>/dev/null)" ]; then
+            echo "  FAIL: reached ensure_tool and started a model install"; exit 1
+          fi
+
+      # GitHub's runners have no Vulkan GPU, so realesrgan-ncnn-vulkan cannot
+      # run. The scale-1 path skips the model entirely, so the whole pipeline
+      # still runs: frame selector, cover-crop, output naming, and the EXIT trap.
+      - name: end to end on the scale-1 path
         run: |
           set -euo pipefail
+          . "$RUNNER_TEMP/expect.sh"
           export UPSCALE_HOME="$RUNNER_TEMP/e2e-sandbox"
           work=$(mktemp -d)
           magick -size 4000x3000 gradient:red-blue "$work/big.png"
           magick -size 200x150 xc:red -size 200x150 xc:green -loop 0 "$work/anim.gif"
 
-          # already covers 1920x1080, so no model and no GPU
+          # a source that already covers the target needs no model
           ./upscale 1080 "$work/big.png" -o "$work/out.png"
-          [ "$(magick identify -format '%wx%h' "$work/out.png")" = "1920x1080" ]
-          ./upscale 1080 "$work/big.png" 2>&1 | grep -q "already covers"
+          [ "$(dims "$work/out.png")" = "1920x1080" ]
+          expect "already covers" ./upscale 1080 "$work/big.png"
 
           # animated input: frame 0 only, and it must say so
-          ./upscale 1080 "$work/anim.gif" -o "$work/anim-out.png" --force 2>&1 | grep -q "only the first"
-          [ "$(magick identify -format '%wx%h' "$work/anim-out.png")" = "1920x1080" ]
+          expect "only the first" ./upscale 1080 "$work/anim.gif" -o "$work/anim-out.png" --force
+          [ "$(dims "$work/anim-out.png")" = "1920x1080" ]
 
           # a filename containing brackets must survive the frame selector
           cp "$work/big.png" "$work/shot[1].png"
           ./upscale 1080 "$work/shot[1].png" -o "$work/br.png"
-          [ "$(magick identify -format '%wx%h' "$work/br.png")" = "1920x1080" ]
+          [ "$(dims "$work/br.png")" = "1920x1080" ]
+
+          # a too-small source must warn, and --force must silence the warning
+          magick -size 80x60 xc:gray "$work/tiny.png"
+          expect "out of reach" ./upscale 8K "$work/tiny.png" -o "$work/t8k.png"
+          expect "interpolated" ./upscale 8K "$work/tiny.png" -o "$work/t8k.png" --force
+
+          # a batch with a bad file in the middle must still write the good ones
+          printf 'not an image' > "$work/broken.png"
+          expect "cannot read image" ./upscale 720 "$work/big.png" "$work/broken.png" -o "$work/batch"
+          [ "$(dims "$work/batch/big-720.png")" = "1280x720" ]
+
+          # two inputs resolving to one output must be refused before any work
+          mkdir -p "$work/a" "$work/b"
+          cp "$work/big.png" "$work/a/same.png"; cp "$work/big.png" "$work/b/same.png"
+          expect "same output" ./upscale 720 "$work/a/same.png" "$work/b/same.png" -o "$work/coll"
+          [ ! -e "$work/coll" ]
 
           # the EXIT trap must leave no scratch directory behind
           if ls -d /tmp/upscale.* >/dev/null 2>&1; then
-            echo "scratch directories left behind:"; ls -d /tmp/upscale.*; exit 1
+            echo "  FAIL: scratch directories left behind:"; ls -d /tmp/upscale.*; exit 1
           fi
-          echo "end-to-end ok, scratch directory cleaned up"

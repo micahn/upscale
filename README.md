@@ -225,6 +225,22 @@ looked. Pass `--all` to remove the launcher regardless.
 
 Override the location with `UPSCALE_HOME`. Override the model with `UPSCALE_MODEL`.
 
+## Development
+
+`upscale selftest` runs 86 assertions over the size table, scale selection,
+output paths, the uninstall guard, the scratch directory, and the frame
+selector. It needs no GPU and no model install, and takes well under a second:
+
+```sh
+./upscale selftest
+```
+
+The model is only downloaded when an input is actually smaller than its target.
+A pure downscale never invokes it, so it never pays for the install.
+
+CI runs `selftest`, `shellcheck`, and an end-to-end pass on every push and pull
+request. `.github/workflows/test.yml` holds the workflow.
+
 ## Credit
 
 Real-ESRGAN by Xintao Wang and the [Real-ESRGAN contributors](https://github.com/xinntao/Real-ESRGAN/graphs/contributors),
