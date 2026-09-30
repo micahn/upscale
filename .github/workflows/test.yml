@@ -1,0 +1,94 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    name: selftest and shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # selftest shells out to magick, and refuses to run without it rather
+      # than passing vacuously, so this is a hard requirement, not a nicety.
+      - name: install ImageMagick
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq imagemagick
+          magick -version | head -1
+
+      - name: bash syntax
+        run: bash -n upscale
+
+      - name: selftest
+        run: ./upscale selftest
+
+      # SC1087 must stay suppressed-by-braces, not silenced by a directive:
+      # ${f[0]} deletes the ImageMagick frame selector and is invisible on a
+      # single-frame JPEG. Keep the whole file clean so the bad form is loud.
+      - name: shellcheck
+        run: |
+          sudo apt-get install -y -qq shellcheck
+          shellcheck upscale
+          echo "no shellcheck disable directives allowed:"
+          ! grep -n 'shellcheck disable' upscale || { echo "found one"; exit 1; }
+
+      # A real end-to-end run is not possible here: GitHub's runners have no
+      # Vulkan GPU, so realesrgan-ncnn-vulkan cannot run. What is checked is
+      # everything that happens before the model is invoked.
+      #
+      # None of these may reach ensure_tool, or the run would pull a 47MB
+      # model install. The sandbox is asserted empty afterwards to prove it.
+      - name: argument handling without a GPU
+        run: |
+          set -euo pipefail
+          export UPSCALE_HOME="$RUNNER_TEMP/fresh-sandbox"
+          ./upscale --help > /dev/null
+          ./upscale 4K 2>&1 | grep -q "no input files"
+          ./upscale 4K /nonexistent.png 2>&1 | grep -q "no such file"
+          ./upscale 99999x99999 /nonexistent.png 2>&1 | grep -q "16384px limit"
+          ./upscale 4K /nonexistent.png -o dir 2>&1 | grep -q "no such file"
+          ./upscale -j 0 4K /nonexistent.png 2>&1 | grep -q "at least 1"
+          if [ -n "$(ls -A "$UPSCALE_HOME" 2>/dev/null)" ]; then
+            echo "reached ensure_tool and started a model install:"; exit 1
+          fi
+          echo "argument handling ok, and no model install was triggered"
+
+      # A real end-to-end run is possible after all, on the scale-1 path: a
+      # source that already covers the target skips the model entirely. This
+      # covers the whole pipeline -- frame selector, cover-crop, output naming --
+      # and proves the EXIT trap removes the scratch directory.
+      - name: end-to-end on the scale-1 path
+        run: |
+          set -euo pipefail
+          export UPSCALE_HOME="$RUNNER_TEMP/e2e-sandbox"
+          work=$(mktemp -d)
+          magick -size 4000x3000 gradient:red-blue "$work/big.png"
+          magick -size 200x150 xc:red -size 200x150 xc:green -loop 0 "$work/anim.gif"
+
+          # already covers 1920x1080, so no model and no GPU
+          ./upscale 1080 "$work/big.png" -o "$work/out.png"
+          [ "$(magick identify -format '%wx%h' "$work/out.png")" = "1920x1080" ]
+          ./upscale 1080 "$work/big.png" 2>&1 | grep -q "already covers"
+
+          # animated input: frame 0 only, and it must say so
+          ./upscale 1080 "$work/anim.gif" -o "$work/anim-out.png" --force 2>&1 | grep -q "only the first"
+          [ "$(magick identify -format '%wx%h' "$work/anim-out.png")" = "1920x1080" ]
+
+          # a filename containing brackets must survive the frame selector
+          cp "$work/big.png" "$work/shot[1].png"
+          ./upscale 1080 "$work/shot[1].png" -o "$work/br.png"
+          [ "$(magick identify -format '%wx%h' "$work/br.png")" = "1920x1080" ]
+
+          # the EXIT trap must leave no scratch directory behind
+          if ls -d /tmp/upscale.* >/dev/null 2>&1; then
+            echo "scratch directories left behind:"; ls -d /tmp/upscale.*; exit 1
+          fi
+          echo "end-to-end ok, scratch directory cleaned up"
