@@ -131,6 +131,8 @@ jobs:
       # GitHub's runners have no Vulkan GPU, so realesrgan-ncnn-vulkan cannot
       # run. The scale-1 path skips the model entirely, so the whole pipeline
       # still runs: frame selector, cover-crop, output naming, and the EXIT trap.
+      # Every fixture is deliberately larger than its target so the run never
+      # needs the model, which is asserted at the end.
       - name: end to end on the scale-1 path
         run: |
           set -euo pipefail
@@ -138,7 +140,7 @@ jobs:
           export UPSCALE_HOME="$RUNNER_TEMP/e2e-sandbox"
           work=$(mktemp -d)
           magick -size 4000x3000 gradient:red-blue "$work/big.png"
-          magick -size 200x150 xc:red -size 200x150 xc:green -loop 0 "$work/anim.gif"
+          magick -delay 10 -size 2000x1125 xc:red -size 2000x1125 xc:green -loop 0 "$work/anim.gif"
 
           # a source that already covers the target needs no model
           ./upscale 1080 "$work/big.png" -o "$work/out.png"
@@ -154,10 +156,9 @@ jobs:
           ./upscale 1080 "$work/shot[1].png" -o "$work/br.png"
           [ "$(dims "$work/br.png")" = "1920x1080" ]
 
-          # a too-small source must warn, and --force must silence the warning
-          magick -size 80x60 xc:gray "$work/tiny.png"
-          expect "out of reach" ./upscale 8K "$work/tiny.png" -o "$work/t8k.png"
-          expect "interpolated" ./upscale 8K "$work/tiny.png" -o "$work/t8k.png" --force
+          # A too-small source would need the model, so it is not exercised
+          # here. The model_undershoots logic behind that warning is covered by
+          # selftest; only its wording is uncovered.
 
           # a batch with a bad file in the middle must still write the good ones
           printf 'not an image' > "$work/broken.png"
@@ -170,7 +171,20 @@ jobs:
           expect "same output" ./upscale 720 "$work/a/same.png" "$work/b/same.png" -o "$work/coll"
           [ ! -e "$work/coll" ]
 
-          # the EXIT trap must leave no scratch directory behind
+          # Nothing above may have needed the model, so nothing may have been
+          # installed, and no scratch directory may survive the EXIT trap.
+          if [ -n "$(ls -A "$UPSCALE_HOME" 2>/dev/null)" ]; then
+            echo "  FAIL: the run installed a model, so it needed the GPU after all"; exit 1
+          fi
           if ls -d /tmp/upscale.* >/dev/null 2>&1; then
             echo "  FAIL: scratch directories left behind:"; ls -d /tmp/upscale.*; exit 1
           fi
+
+      - name: what CI does not cover
+        if: always()
+        run: |
+          echo "not covered here:"
+          echo "  - the model invocation itself, and the EXIF rotate it feeds:"
+          echo "    GitHub's runners have no Vulkan GPU"
+          echo "  - the small-source warning wording, which only fires when the"
+          echo "    model is invoked (the model_undershoots logic is in selftest)"
