@@ -159,6 +159,18 @@ do_uninstall() {
   printf 'upscale: uninstall complete.\n' >&2
 }
 
+# True when a target is within MAX_EDGE on both axes. Beyond that it is a typo
+# or a joke, and attempting it would hang or OOM the GPU.
+edge_ok() {
+  (( $1 <= MAX_EDGE && $2 <= MAX_EDGE ))
+}
+
+# The [0] here is an ImageMagick frame selector, not a bash array index. It
+# lives in a function so selftest can cover the expansion: written inline as
+# ${f[0]} bash reads it as an array index and deletes the selector, which is
+# invisible on a single-frame JPEG and silently breaks animated input.
+frame0() { printf '%s[0]' "$1"; }
+
 usage() {
   cat <<EOF
 upscale - local AI image upscaler
@@ -188,6 +200,18 @@ EOF
 
 selftest() {
   local f=0
+  # The process_one assertions below go through magick. Without it every input
+  # fails, and all of them expect a failure, so they would pass for the wrong
+  # reason -- a green run that checked nothing. Require it up front.
+  command -v magick >/dev/null \
+    || die "selftest needs magick (ImageMagick); without it the process_one checks pass vacuously"
+  # Existing is not enough: a `magick` that is present but does not work makes
+  # every identify return nothing, every process_one call fail, and every
+  # assertion that expects a failure pass. So check that it actually works.
+  local probe; probe=$(mktemp -d)/probe.png
+  magick -size 4x4 xc:red "$probe" 2>/dev/null || die "selftest needs a working magick"
+  [[ $(magick identify -format '%wx%h' "$probe" 2>/dev/null) == 4x4 ]] \
+    || die "selftest needs a working magick: identify returned '$(magick identify -format '%wx%h' "$probe" 2>/dev/null)'"
   check() { if [[ "$2" != "$3" ]]; then printf 'FAIL %s: got "%s" want "%s"\n' "$1" "$2" "$3"; f=1; fi; }
   check 4k        "$(target_size 4K)"        "3840 2160"
   check 4k-low    "$(target_size 4k)"        "3840 2160"
@@ -204,6 +228,16 @@ selftest() {
   check s-4       "$(pick_scale 200 120 800 480)"     "4"
   check s-4-max   "$(pick_scale 100 100 8000 8000)"   "4"
   check s-3       "$(pick_scale 400 300 1200 900)"    "3"
+  # The cases above are all decided by the width alone. These three are not:
+  # the width is met early but the height is not, so dropping `sh * c` from
+  # pick_scale changes the answer. They are the only coverage of that clause.
+  check s-h-short  "$(pick_scale 1920 200 1920 1080)" "4"
+  check s-h-short2 "$(pick_scale 1000 300 1200 1000)" "4"
+  check s-h-exact  "$(pick_scale 1920 1080 1920 1080)" "1"
+  # ...and these three are decided by the height alone, covering `sw * c`.
+  check s-w-narrow  "$(pick_scale 200 1080 1920 1080)" "4"
+  check s-w-narrow2 "$(pick_scale 300 1000 1200 1000)" "4"
+  check s-w-tall    "$(pick_scale 1080 1920 1920 1080)" "2"
   # uninstall safety: the guard must only accept a real, deep sandbox
   local sandbox
   sandbox=$(mktemp -d) || die "selftest: mktemp failed"
@@ -251,6 +285,12 @@ selftest() {
   # the bug: two dirs, same stem, one -o must collide rather than overwrite
   check op-clash1    "$(out_path a/photo.png o 4K 2)"              "o/photo-4k.png"
   check op-clash2    "$(out_path b/photo.png o 4K 2)"              "o/photo-4k.png"
+  # The frame selector has to survive a filename that contains brackets itself.
+  # ${f[0]} would delete the selector, which no single-frame test can see.
+  check fr-plain     "$(frame0 photo.png)"         "photo.png[0]"
+  check fr-bracket   "$(frame0 'shot[1].jpg')"      "shot[1].jpg[0]"
+  check fr-odd       "$(frame0 'unbal[.jpg')"       "unbal[.jpg[0]"
+  check fr-space     "$(frame0 'my photo.png')"    "my photo.png[0]"
   # -f changes the extension, and the collision check keys off the full path,
   # so a format cannot mask a clash
   check op-fmt-jpg   "$(out_path a/photo.png o 4K 2 jpg)"          "o/photo-4k.jpg"
@@ -268,8 +308,17 @@ selftest() {
   # a source that cannot reach the target even at the 4x clamp
   check un-tiny      "$(model_undershoots 100 100 7680 4320; echo $?)" "0"
   check un-short-w   "$(model_undershoots 100 100 800 100; echo $?)"    "0"
+  check un-short-h   "$(model_undershoots 1920 200 1920 1080; echo $?)" "0"
+  check un-short-h2  "$(model_undershoots 1000 250 1000 2000; echo $?)" "0"
+  check un-h-covers  "$(model_undershoots 1000 300 1200 1000; echo $?)" "1"
   check un-enough    "$(model_undershoots 1920 1080 3840 2160; echo $?)" "1"
   check un-generous  "$(model_undershoots 4000 3000 1920 1080; echo $?)" "1"
+  # the size cap, which lives in edge_ok so it is reachable from here
+  check edge-8k      "$(edge_ok 7680 4320; echo $?)"   "0"
+  check edge-at-cap  "$(edge_ok 16384 16384; echo $?)" "0"
+  check edge-over-w  "$(edge_ok 16385 4320; echo $?)"   "1"
+  check edge-over-h  "$(edge_ok 7680 16385; echo $?)"   "1"
+  check edge-absurd  "$(edge_ok 99999 99999; echo $?)"  "1"
   # and the percentage the final Lanczos step has to make up
   check bu-tiny-8k   "$(blowup_pct 100 100 7680 4320)"   "1920"
   check bu-short     "$(blowup_pct 100 100 400 100)"     "100"
@@ -346,7 +395,8 @@ process_one() {
   # index, and must be written as ${f}[0]. shellcheck's other suggestion,
   # ${f[0]}, makes bash eat the selector instead of passing it on -- a change
   # that is invisible for a single-frame JPEG and silently breaks animations.
-  if ! dims_in=$(magick identify -format "%[orientation] %w %h" "${f}[0]"); then
+  # frame0() exists so selftest can cover this; see the comment on it.
+  if ! dims_in=$(magick identify -format "%[orientation] %w %h" "$(frame0 "$f")"); then
     printf 'upscale: cannot read image: %s\n' "$f" >&2
     return 1
   fi
@@ -368,8 +418,7 @@ process_one() {
       printf 'upscale: %s has %s frames; only the first is upscaled (no animation support)\n' \
         "$f" "$frames" >&2
     fi
-    # ${f}[0], not ${f[0]} -- see the note at the read above.
-    if ! magick "${f}[0]" -auto-orient "$WORK/$nth.frame.png"; then
+    if ! magick "$(frame0 "$f")" -auto-orient "$WORK/$nth.frame.png"; then
       printf 'upscale: cannot read image: %s\n' "$f" >&2
       return 1
     fi
@@ -504,7 +553,7 @@ main() {
   local dims
   dims=$(target_size "$spec") || die "unknown size '$spec' (try 1080, 4K, 4KUW, 800x600)"
   local tw th; read -r tw th <<<"$dims"
-  if (( tw > MAX_EDGE || th > MAX_EDGE )); then
+  if ! edge_ok "$tw" "$th"; then
     die "target ${tw}x${th} is larger than the ${MAX_EDGE}px limit on either axis
   (that is a typo, or a target the model cannot approach from any real photo).
   Use something up to ${MAX_EDGE}x${MAX_EDGE}."
@@ -532,7 +581,24 @@ main() {
     printf '  %s\n' "${missing[@]}" >&2
   fi
 
-  local bin; bin=$(ensure_tool)
+  # The model is only needed if some input is actually smaller than its target.
+  # On the scale-1 path it is never invoked, so a pure downscale should not pay
+  # for a 47MB install. Dimensions are read exactly as process_one reads them --
+  # displayed, not stored -- so this pre-scan cannot disagree with the decision
+  # it is predicting. An unreadable file is left to process_one to report.
+  local need_model=0 sw sh dims_probe
+  for f in "${files[@]}"; do
+    [[ -f $f ]] || continue
+    dims_probe=$(magick identify -auto-orient -format "%w %h" "$(frame0 "$f")" 2>/dev/null) || continue
+    read -r sw sh <<<"$dims_probe"
+    (( sw >= tw && sh >= th )) || need_model=1
+  done
+
+  local bin="" bindir=""
+  if (( need_model )); then
+    bin=$(ensure_tool)
+    bindir=$(dirname -- "$bin")
+  fi
 
   new_workdir
 
@@ -569,7 +635,6 @@ main() {
   #
   # Each file writes to its own log, and a log is printed when its job finishes,
   # so concurrent output stays grouped per file instead of interleaving.
-  local bindir; bindir=$(dirname -- "$bin")
   local -A logof=()          # pid -> log file
   local -a live=()           # pids still running
   local running=0 finished

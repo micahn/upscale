@@ -1,0 +1,190 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: selftest, shellcheck, end to end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # selftest shells out to magick and refuses to run without it, rather than
+      # passing vacuously, so this is a hard requirement rather than a nicety.
+      #
+      # Ubuntu's imagemagick package is ImageMagick 6, which ships `convert` and
+      # no `magick`. upscale targets ImageMagick 7, so if `magick` is missing a
+      # shim is installed that forwards to `convert`. selftest and the
+      # end-to-end step then check that the magick in use actually behaves, so
+      # a shim that did not work would fail loudly rather than pass quietly.
+      # CI therefore covers ImageMagick 6 semantics, not 7; the model path is
+      # uncovered either way, since the runners have no Vulkan GPU.
+      - name: install ImageMagick and shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq imagemagick shellcheck
+          if ! command -v magick >/dev/null; then
+            # IM7 folds identify and convert into one `magick` binary. IM6 has
+            # separate `identify` and `convert` binaries, and `convert identify`
+            # treats "identify" as an input filename, so every identify call
+            # would silently return nothing. Dispatch on it.
+            cat <<'SH' | sudo tee /usr/local/bin/magick >/dev/null
+          #!/bin/sh
+          if [ "$1" = "identify" ]; then
+            shift
+            exec identify "$@"
+          fi
+          exec convert "$@"
+          SH
+            sudo chmod +x /usr/local/bin/magick
+            echo "installed a dispatch shim as magick"
+          fi
+          magick -version | head -2
+          shellcheck --version | head -2
+
+          # Check every identify form upscale depends on, here rather than
+          # letting a later step fail cryptically. %[orientation] is a synthetic
+          # property and is the one most likely to be missing in ImageMagick 6.
+          # An empty result is a failure: that is what made selftest pass with
+          # nothing checked.
+          set -e
+          magick -size 8x8 xc:red /tmp/probe.png
+          probe() {
+            local label=$1; shift
+            local got; got=$(magick identify "$@" /tmp/probe.png 2>&1) || got="(error) $got"
+            if [ -z "$got" ]; then
+              echo "  $label -> EMPTY, which would make upscale fail silently"; exit 1
+            fi
+            printf '  %s -> %s\n' "$label" "$got"
+          }
+          probe "%[orientation]" -format '%[orientation]'
+          probe "%n" -format '%n '
+          probe "auto-orient %w %h" -auto-orient -format '%w %h'
+          probe "%wx%h" -format '%wx%h'
+          echo "  all identify forms usable"
+
+      # upscale exits non-zero for every one of the cases checked below, so its
+      # output must be captured before grepping. `upscale ... | grep -q` fails
+      # under pipefail even when grep matches, because the left side exits 1.
+      - name: helpers
+        run: |
+          cat > "$RUNNER_TEMP/expect.sh" <<'SH'
+          expect() {
+            local want=$1; shift
+            local got rc
+            got=$("$@" 2>&1) && rc=0 || rc=$?
+            case "$got" in
+              *"$want"*) printf '  ok (exit %s): %s\n' "$rc" "$*" ;;
+              *) printf '  FAIL: %s\n    wanted [%s] in:\n%s\n' "$*" "$want" "$got"; exit 1 ;;
+            esac
+          }
+          dims() { magick identify -format '%wx%h' "$1"; }
+          SH
+
+      - name: bash syntax
+        run: bash -n upscale
+
+      - name: selftest
+        run: ./upscale selftest
+
+      # SC1087 must stay fixed with braces, not silenced with a directive:
+      # ${f[0]} deletes the ImageMagick frame selector, and that is invisible on
+      # a single-frame JPEG. Keeping the file clean keeps the bad form loud.
+      - name: shellcheck
+        run: |
+          shellcheck upscale
+          if grep -n 'shellcheck disable' upscale; then
+            echo "a shellcheck disable directive was found; fix the code instead"; exit 1
+          fi
+
+      # Everything that happens before the model is invoked. None of these may
+      # reach ensure_tool, or the run would pull a 47MB model install, so the
+      # sandbox is asserted empty afterwards to prove it did not.
+      - name: argument handling without a GPU
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/expect.sh"
+          export UPSCALE_HOME="$RUNNER_TEMP/arg-sandbox"
+
+          expect "no input files"      ./upscale 4K
+          expect "no such file"        ./upscale 4K /nonexistent.png
+          expect "no such file"        ./upscale 4K /nonexistent.png -o dir
+          expect "16384px limit"       ./upscale 99999x99999 /nonexistent.png
+          expect "at least 1"          ./upscale -j 0 4K /nonexistent.png
+          expect "needs a number"      ./upscale -j x 4K /nonexistent.png
+          expect "unsupported format"  ./upscale -f gif 4K /nonexistent.png
+          expect "cannot load a model" ./upscale 4K /nonexistent.png -m /tmp/x.param
+          expect "unknown size"        ./upscale 4QQ /nonexistent.png
+          ./upscale --help > /dev/null
+
+          if [ -n "$(ls -A "$UPSCALE_HOME" 2>/dev/null)" ]; then
+            echo "  FAIL: reached ensure_tool and started a model install"; exit 1
+          fi
+
+      # GitHub's runners have no Vulkan GPU, so realesrgan-ncnn-vulkan cannot
+      # run. The scale-1 path skips the model entirely, so the whole pipeline
+      # still runs: frame selector, cover-crop, output naming, and the EXIT trap.
+      # Every fixture is deliberately larger than its target so the run never
+      # needs the model, which is asserted at the end.
+      - name: end to end on the scale-1 path
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/expect.sh"
+          export UPSCALE_HOME="$RUNNER_TEMP/e2e-sandbox"
+          work=$(mktemp -d)
+          magick -size 4000x3000 gradient:red-blue "$work/big.png"
+          magick -delay 10 -size 2000x1125 xc:red -size 2000x1125 xc:green -loop 0 "$work/anim.gif"
+
+          # a source that already covers the target needs no model
+          ./upscale 1080 "$work/big.png" -o "$work/out.png"
+          [ "$(dims "$work/out.png")" = "1920x1080" ]
+          expect "already covers" ./upscale 1080 "$work/big.png"
+
+          # animated input: frame 0 only, and it must say so
+          expect "only the first" ./upscale 1080 "$work/anim.gif" -o "$work/anim-out.png" --force
+          [ "$(dims "$work/anim-out.png")" = "1920x1080" ]
+
+          # a filename containing brackets must survive the frame selector
+          cp "$work/big.png" "$work/shot[1].png"
+          ./upscale 1080 "$work/shot[1].png" -o "$work/br.png"
+          [ "$(dims "$work/br.png")" = "1920x1080" ]
+
+          # A too-small source would need the model, so it is not exercised
+          # here. The model_undershoots logic behind that warning is covered by
+          # selftest; only its wording is uncovered.
+
+          # a batch with a bad file in the middle must still write the good ones
+          printf 'not an image' > "$work/broken.png"
+          expect "cannot read image" ./upscale 720 "$work/big.png" "$work/broken.png" -o "$work/batch"
+          [ "$(dims "$work/batch/big-720.png")" = "1280x720" ]
+
+          # two inputs resolving to one output must be refused before any work
+          mkdir -p "$work/a" "$work/b"
+          cp "$work/big.png" "$work/a/same.png"; cp "$work/big.png" "$work/b/same.png"
+          expect "same output" ./upscale 720 "$work/a/same.png" "$work/b/same.png" -o "$work/coll"
+          [ ! -e "$work/coll" ]
+
+          # Nothing above may have needed the model, so nothing may have been
+          # installed, and no scratch directory may survive the EXIT trap.
+          if [ -n "$(ls -A "$UPSCALE_HOME" 2>/dev/null)" ]; then
+            echo "  FAIL: the run installed a model, so it needed the GPU after all"; exit 1
+          fi
+          if ls -d /tmp/upscale.* >/dev/null 2>&1; then
+            echo "  FAIL: scratch directories left behind:"; ls -d /tmp/upscale.*; exit 1
+          fi
+
+      - name: what CI does not cover
+        if: always()
+        run: |
+          echo "not covered here:"
+          echo "  - the model invocation itself, and the EXIF rotate it feeds:"
+          echo "    GitHub's runners have no Vulkan GPU"
+          echo "  - the small-source warning wording, which only fires when the"
+          echo "    model is invoked (the model_undershoots logic is in selftest)"
