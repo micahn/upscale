@@ -329,7 +329,6 @@ selftest() {
   check mf-pair    "$(model_files "$mdir" realesr-animevideov3 | wc -l)"    "3"
   # help lists the three installable models, and names the unavailable one
   # separately so it is not mistaken for something that can be installed
-  check help-list  "$(models_help | grep -cE '^  (realesrgan|realesr-)')"   "3"
   check help-unav  "$(models_help | grep -c 'cannot be installed')"         "1"
   # models remove is destructive, so exercise it on the throwaway dir
   : > "$mdir/realesrgan-x4plus-anime.param"
@@ -343,11 +342,13 @@ selftest() {
   # Both listings mark the default, and only when something is installed at all,
   # so the expectations below branch on whether this machine has the models.
   if [[ -n $(installed_models) ]]; then
+    check help-list  "$(models_help | grep -cE '^  (realesrgan|realesr-)')" "3"
     check list-default "$(models_list | grep -cF "$MODEL *")"              "1"
     check list-header  "$(models_list | grep -cE '^ +NAME +STYLE +SIZE +NOTE$')" "1"
     check help-default "$(models_help | grep -c '<- default')"             "1"
     check help-onmodel "$(models_help | grep -cF "$MODEL  (")"             "1"
   else
+    check help-list  "$(models_help | grep -cE '^  (realesrgan|realesr-)')" "0"
     check list-default "$(models_list | grep -cF "$MODEL *")"              "0"
     check list-header  "$(models_list | grep -cE '^ +NAME +STYLE +SIZE +NOTE$')" "0"
     check help-default "$(models_help | grep -c '<- default')"             "0"

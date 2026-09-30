@@ -94,6 +94,33 @@ jobs:
       - name: selftest
         run: ./upscale selftest
 
+      # The assertions above run with no models installed, because this runner
+      # has no sandbox. Several assertions also branch on whether models are
+      # present, and getting that branch wrong is invisible from one side. So
+      # fabricate a sandbox with model weights in it and run the same suite
+      # again, which is the state a normal machine is in.
+      - name: selftest with models present
+        run: |
+          set -euo pipefail
+          curl -fsSL https://mise.run | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          sandbox="$RUNNER_TEMP/with-models"
+          install_dir="$sandbox/mise/data/installs/github-xinntao-real-esrgan/0.2.5.0"
+          mkdir -p "$install_dir/models" "$sandbox/mise/config"
+          printf '[tools]\n"github:xinntao/Real-ESRGAN" = "0.2.5.0"\n' \
+            > "$sandbox/mise/config/config.toml"
+          for m in realesrgan-x4plus realesrgan-x4plus-anime \
+                   realesr-animevideov3-x2 realesr-animevideov3-x3 \
+                   realesr-animevideov3-x4; do
+            : > "$install_dir/models/$m.param"
+            : > "$install_dir/models/$m.bin"
+          done
+          UPSCALE_HOME="$sandbox" ./upscale selftest
+          # and the listings must reflect that sandbox
+          UPSCALE_HOME="$sandbox" ./upscale models | grep -q 'realesrgan-x4plus'
+          UPSCALE_HOME="$sandbox" ./upscale --help | grep -q 'installed models'
+          echo "selftest passes in both states: no models, and models present"
+
       # SC1087 must stay fixed with braces, not silenced with a directive:
       # ${f[0]} deletes the ImageMagick frame selector, and that is invisible on
       # a single-frame JPEG. Keeping the file clean keeps the bad form loud.
