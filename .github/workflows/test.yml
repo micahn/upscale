@@ -31,22 +31,44 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq imagemagick shellcheck
           if ! command -v magick >/dev/null; then
-            printf '#!/bin/sh\nexec convert "$@"\n' | sudo tee /usr/local/bin/magick >/dev/null
+            # IM7 folds identify and convert into one `magick` binary. IM6 has
+            # separate `identify` and `convert` binaries, and `convert identify`
+            # treats "identify" as an input filename, so every identify call
+            # would silently return nothing. Dispatch on it.
+            cat <<'SH' | sudo tee /usr/local/bin/magick >/dev/null
+          #!/bin/sh
+          if [ "$1" = "identify" ]; then
+            shift
+            exec identify "$@"
+          fi
+          exec convert "$@"
+          SH
             sudo chmod +x /usr/local/bin/magick
-            echo "installed a convert shim as magick"
+            echo "installed a dispatch shim as magick"
           fi
           magick -version | head -2
           shellcheck --version | head -2
 
           # Check every identify form upscale depends on, here rather than
-          # letting a later step fail cryptically. %[orientation] in particular
-          # is a synthetic property and may not exist in ImageMagick 6.
+          # letting a later step fail cryptically. %[orientation] is a synthetic
+          # property and is the one most likely to be missing in ImageMagick 6.
+          # An empty result is a failure: that is what made selftest pass with
+          # nothing checked.
           set -e
           magick -size 8x8 xc:red /tmp/probe.png
-          printf '  %%[orientation] -> %s\n' "$(magick identify -format '%[orientation]' /tmp/probe.png)"
-          printf '  %%n -> %s\n'         "$(magick identify -format '%n ' /tmp/probe.png)"
-          printf '  auto-orient %%w %%h -> %s\n' "$(magick identify -auto-orient -format '%w %h' /tmp/probe.png)"
-          printf '  %%wx%%h -> %s\n'      "$(magick identify -format '%wx%h' /tmp/probe.png)"
+          probe() {
+            local label=$1; shift
+            local got; got=$(magick identify "$@" /tmp/probe.png 2>&1) || got="(error) $got"
+            if [ -z "$got" ]; then
+              echo "  $label -> EMPTY, which would make upscale fail silently"; exit 1
+            fi
+            printf '  %s -> %s\n' "$label" "$got"
+          }
+          probe "%[orientation]" -format '%[orientation]'
+          probe "%n" -format '%n '
+          probe "auto-orient %w %h" -auto-orient -format '%w %h'
+          probe "%wx%h" -format '%wx%h'
+          echo "  all identify forms usable"
 
       # upscale exits non-zero for every one of the cases checked below, so its
       # output must be captured before grepping. `upscale ... | grep -q` fails

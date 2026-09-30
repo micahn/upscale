@@ -205,6 +205,13 @@ selftest() {
   # reason -- a green run that checked nothing. Require it up front.
   command -v magick >/dev/null \
     || die "selftest needs magick (ImageMagick); without it the process_one checks pass vacuously"
+  # Existing is not enough: a `magick` that is present but does not work makes
+  # every identify return nothing, every process_one call fail, and every
+  # assertion that expects a failure pass. So check that it actually works.
+  local probe; probe=$(mktemp -d)/probe.png
+  magick -size 4x4 xc:red "$probe" 2>/dev/null || die "selftest needs a working magick"
+  [[ $(magick identify -format '%wx%h' "$probe" 2>/dev/null) == 4x4 ]] \
+    || die "selftest needs a working magick: identify returned '$(magick identify -format '%wx%h' "$probe" 2>/dev/null)'"
   check() { if [[ "$2" != "$3" ]]; then printf 'FAIL %s: got "%s" want "%s"\n' "$1" "$2" "$3"; f=1; fi; }
   check 4k        "$(target_size 4K)"        "3840 2160"
   check 4k-low    "$(target_size 4k)"        "3840 2160"
