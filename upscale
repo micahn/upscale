@@ -200,6 +200,11 @@ EOF
 
 selftest() {
   local f=0
+  # The process_one assertions below go through magick. Without it every input
+  # fails, and all of them expect a failure, so they would pass for the wrong
+  # reason -- a green run that checked nothing. Require it up front.
+  command -v magick >/dev/null \
+    || die "selftest needs magick (ImageMagick); without it the process_one checks pass vacuously"
   check() { if [[ "$2" != "$3" ]]; then printf 'FAIL %s: got "%s" want "%s"\n' "$1" "$2" "$3"; f=1; fi; }
   check 4k        "$(target_size 4K)"        "3840 2160"
   check 4k-low    "$(target_size 4k)"        "3840 2160"
