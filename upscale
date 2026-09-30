@@ -463,17 +463,21 @@ models_dir() {
   printf '%s' "$d/models"
 }
 
-catalog_field() {  # $1 = name, $2 = 1|2  (name | style | note)
-  local e
+# $1 = model name, $2 = 1 for style, 3 for the note (1 is the name itself).
+# Uses parameter expansion rather than cut: models_list calls this several times
+# per model, and a subshell and an external process each time is wasteful for
+# splitting one string.
+catalog_field() {
+  local e rest
   for e in "${MODEL_CATALOG[@]}"; do
-    if [[ ${e%%|*} == "$1" ]]; then
-      case $2 in
-        1) printf '%s' "$e" | cut -d'|' -f1 ;;
-        2) printf '%s' "$e" | cut -d'|' -f2 ;;
-        3) printf '%s' "$e" | cut -d'|' -f3 ;;
-      esac
-      return 0
-    fi
+    [[ ${e%%|*} == "$1" ]] || continue
+    rest=${e#*|}
+    case $2 in
+      1) printf '%s' "${e%%|*}" ;;
+      2) printf '%s' "${rest%%|*}" ;;
+      3) printf '%s' "${rest#*|}" ;;
+    esac
+    return 0
   done
   return 1
 }

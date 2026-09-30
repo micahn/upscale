@@ -116,9 +116,15 @@ jobs:
             : > "$install_dir/models/$m.bin"
           done
           UPSCALE_HOME="$sandbox" ./upscale selftest
-          # and the listings must reflect that sandbox
-          UPSCALE_HOME="$sandbox" ./upscale models | grep -q 'realesrgan-x4plus'
-          UPSCALE_HOME="$sandbox" ./upscale --help | grep -q 'installed models'
+
+          # The listings must reflect that sandbox. Captured before grepping,
+          # never piped: `upscale models | grep -q` dies of SIGPIPE, because
+          # grep -q exits on the first match and closes the pipe, and under
+          # pipefail the 141 is treated as a failure. Same trap as above.
+          listing=$(UPSCALE_HOME="$sandbox" ./upscale models)
+          grep -q 'realesrgan-x4plus' <<< "$listing"
+          helptext=$(UPSCALE_HOME="$sandbox" ./upscale --help)
+          grep -q 'installed models' <<< "$helptext"
           echo "selftest passes in both states: no models, and models present"
 
       # SC1087 must stay fixed with braces, not silenced with a directive:
